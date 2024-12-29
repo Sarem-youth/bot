@@ -178,3 +178,72 @@ class MT5Adapter:
         self.push_socket.close()
         self.pull_socket.close()
         self.context.term()
+
+class MT5TesterAdapter:
+    def __init__(self, config: MT5Config):
+        self.config = config
+        self.is_testing = False
+        self.is_optimization = False
+        self.test_symbol = ""
+        self.test_period = 0
+        self.optimization_inputs = {}
+        
+    def init_tester(self, symbol: str, timeframe: int, testing: bool = False, optimization: bool = False):
+        """Initialize MT5 Strategy Tester"""
+        if not mt5.initialize():
+            logger.error("Failed to initialize MT5")
+            return False
+            
+        self.is_testing = testing
+        self.is_optimization = optimization
+        self.test_symbol = symbol
+        self.test_period = timeframe
+        
+        if testing:
+            # Configure tester settings
+            tester_settings = {
+                "symbol": symbol,
+                "period": timeframe,
+                "spread": 2,  # Default spread in points
+                "model": mt5.TERMINAL_TESTER_MODEL_EVERY_TICK,  # Every tick mode
+                "use_spread": True
+            }
+            
+            if not mt5.tester_set_parameters(**tester_settings):
+                logger.error("Failed to set tester parameters")
+                return False
+                
+        return True
+        
+    def set_optimization_inputs(self, inputs: Dict):
+        """Set optimization parameters"""
+        self.optimization_inputs = inputs
+        if self.is_optimization:
+            for param, value in inputs.items():
+                if isinstance(value, tuple):
+                    # Format: (start, step, stop)
+                    mt5.tester_set_parameter(param, *value)
+                else:
+                    mt5.tester_set_parameter(param, value)
+                    
+    async def run_test(self, start_date: datetime, end_date: datetime) -> Dict:
+        """Run strategy test"""
+        if not self.is_testing:
+            return {}
+            
+        result = mt5.tester_run(
+            start_date=start_date,
+            end_date=end_date,
+            symbol=self.test_symbol,
+            period=self.test_period
+        )
+        
+        if not result:
+            logger.error("Strategy test failed")
+            return {}
+            
+        return {
+            'trades': mt5.tester_get_trades(),
+            'results': mt5.tester_get_results(),
+            'optimization': mt5.tester_get_optimization() if self.is_optimization else None
+        }

@@ -388,3 +388,96 @@ class BacktestEngine:
             data['volume'] *= scenario['magnitude']
             
         return data
+
+class MT5BacktestEngine(BacktestEngine):
+    def __init__(self, initial_balance: float = 10000):
+        super().__init__(initial_balance)
+        self.mt5_mode = False
+        self.optimization_params = {}
+        
+    def set_mt5_mode(self, enabled: bool = True):
+        """Enable/disable MT5 compatibility mode"""
+        self.mt5_mode = enabled
+        
+    def set_optimization_params(self, params: Dict):
+        """Set optimization parameters for MT5"""
+        self.optimization_params = params
+        
+    def run_backtest(self, 
+                     strategy: object, 
+                     historical_data: pd.DataFrame,
+                     start_date: datetime,
+                     end_date: datetime,
+                     parallel: bool = True) -> Dict:
+        """Enhanced backtest with MT5 compatibility"""
+        if self.mt5_mode:
+            return self._run_mt5_backtest(strategy, start_date, end_date)
+        return super().run_backtest(strategy, historical_data, start_date, end_date, parallel)
+        
+    def _run_mt5_backtest(self, strategy: object, start_date: datetime, end_date: datetime) -> Dict:
+        """Run backtest using MT5's strategy tester"""
+        # Convert strategy parameters for MT5
+        mt5_params = self._convert_strategy_params(strategy)
+        
+        # Initialize MT5 tester
+        if not hasattr(self, 'mt5_adapter'):
+            self.mt5_adapter = MT5TesterAdapter(MT5Config())
+            
+        # Configure test
+        self.mt5_adapter.init_tester(
+            symbol=strategy.symbol,
+            timeframe=strategy.timeframe,
+            testing=True,
+            optimization=bool(self.optimization_params)
+        )
+        
+        if self.optimization_params:
+            self.mt5_adapter.set_optimization_inputs(self.optimization_params)
+            
+        # Run test
+        results = asyncio.run(self.mt5_adapter.run_test(start_date, end_date))
+        
+        # Convert results to standard format
+        return self._convert_mt5_results(results)
+        
+    def _convert_strategy_params(self, strategy: object) -> Dict:
+        """Convert strategy parameters to MT5 format"""
+        params = {}
+        for param_name, param_value in strategy.__dict__.items():
+            if not param_name.startswith('_'):
+                params[param_name] = param_value
+        return params
+        
+    def _convert_mt5_results(self, mt5_results: Dict) -> Dict:
+        """Convert MT5 results to standard format"""
+        if not mt5_results:
+            return {}
+            
+        trades = []
+        for trade in mt5_results['trades']:
+            trades.append({
+                'entry_time': trade.time,
+                'entry_price': trade.price,
+                'type': 'BUY' if trade.type == 0 else 'SELL',
+                'size': trade.volume,
+                'pnl': trade.profit,
+                'duration': trade.time_exit - trade.time if trade.time_exit else 0
+            })
+            
+        results = mt5_results['results']
+        self.performance_metrics = {
+            'total_trades': results.trades,
+            'win_rate': results.profit_trades / results.trades if results.trades > 0 else 0,
+            'profit_factor': results.profit_factor,
+            'sharpe_ratio': results.sharp_ratio,
+            'max_drawdown': results.max_drawdown,
+            'total_return': results.profit,
+            'avg_trade_duration': results.average_trade_length,
+            'avg_profit_per_trade': results.profit / results.trades if results.trades > 0 else 0
+        }
+        
+        return {
+            'metrics': self.performance_metrics,
+            'trades': trades,
+            'optimization_results': mt5_results.get('optimization')
+        }
