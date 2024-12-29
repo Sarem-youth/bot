@@ -85,3 +85,124 @@ for scenario, results in stress_test_results.items():
 
 # Generate performance report
 backtester.plot_results('strategy_performance.png')
+
+import pytest
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from backtester import BacktestEngine, MT5BacktestEngine
+from mt5_adapter import MT5Config
+
+@pytest.fixture
+def sample_data():
+    dates = pd.date_range(start='2023-01-01', end='2023-12-31', freq='1H')
+    data = pd.DataFrame({
+        'time': dates,
+        'open': np.random.normal(1800, 20, len(dates)),
+        'high': np.random.normal(1810, 20, len(dates)),
+        'low': np.random.normal(1790, 20, len(dates)),
+        'close': np.random.normal(1800, 20, len(dates)),
+        'volume': np.random.randint(100, 1000, len(dates))
+    })
+    data['high'] = data[['open', 'high', 'close']].max(axis=1)
+    data['low'] = data[['open', 'low', 'close']].min(axis=1)
+    return data
+
+@pytest.fixture
+def mock_strategy():
+    class Strategy:
+        def __init__(self):
+            self.symbol = "XAUUSD"
+            self.timeframe = 60
+            self.max_positions = 1
+            
+        def analyze_market(self, data):
+            return {
+                'type': 'BUY',
+                'size': 1.0,
+                'stop_loss': data['close'].iloc[-1] * 0.99,
+                'take_profit': data['close'].iloc[-1] * 1.01
+            }
+    return Strategy()
+
+class TestBacktestEngine:
+    def test_initialization(self):
+        engine = BacktestEngine(initial_balance=10000)
+        assert engine.initial_balance == 10000
+        assert len(engine.trades_history) == 0
+        
+    def test_run_backtest(self, sample_data, mock_strategy):
+        engine = BacktestEngine()
+        start_date = datetime(2023, 1, 1)
+        end_date = datetime(2023, 12, 31)
+        
+        results = engine.run_backtest(
+            mock_strategy,
+            sample_data,
+            start_date,
+            end_date
+        )
+        
+        assert 'metrics' in results
+        assert 'trades' in results
+        assert 'equity_curve' in results
+        assert len(engine.trades_history) > 0
+        
+    def test_stress_test(self, sample_data, mock_strategy):
+        engine = BacktestEngine()
+        scenarios = [{
+            'name': 'High Volatility',
+            'type': 'volatility_shock',
+            'magnitude': 0.05
+        }]
+        
+        results = engine.stress_test_strategy(
+            mock_strategy,
+            sample_data,
+            scenarios
+        )
+        
+        assert 'High Volatility' in results
+        assert 'metrics' in results['High Volatility']
+        
+class TestMT5BacktestEngine:
+    def test_mt5_mode(self, sample_data, mock_strategy):
+        engine = MT5BacktestEngine()
+        engine.set_mt5_mode(True)
+        
+        with patch('backtester.MT5TesterAdapter') as mock_adapter:
+            mock_adapter.return_value.init_tester.return_value = True
+            mock_adapter.return_value.run_test.return_value = {
+                'trades': [],
+                'results': Mock(
+                    trades=10,
+                    profit_trades=6,
+                    profit_factor=1.5,
+                    sharp_ratio=1.2,
+                    max_drawdown=0.1,
+                    profit=1000,
+                    average_trade_length=120
+                )
+            }
+            
+            results = engine.run_backtest(
+                mock_strategy,
+                sample_data,
+                datetime(2023, 1, 1),
+                datetime(2023, 12, 31)
+            )
+            
+            assert results['metrics']['total_trades'] == 10
+            assert results['metrics']['win_rate'] == 0.6
+            
+    def test_optimization(self, mock_strategy):
+        engine = MT5BacktestEngine()
+        engine.set_mt5_mode(True)
+        
+        optimization_params = {
+            'ma_period': (10, 1, 20),
+            'stop_loss': (20, 5, 50)
+        }
+        
+        engine.set_optimization_params(optimization_params)
+        assert engine.optimization_params == optimization_params
