@@ -66,38 +66,8 @@ class StrategyValidator:
     def optimize_parameters(self, 
                           strategy_class, 
                           param_space: Dict,
-                          n_trials: int = 100,
-                          optimization_method: str = 'bayesian',
-                          **kwargs) -> Tuple[Dict, float]:
-        """
-        Optimize strategy parameters using specified method
-        """
-        optimizers = {
-            'bayesian': self._bayesian_optimization,
-            'genetic': self._genetic_optimization,
-            'random': self._random_search,
-            'grid': self._grid_search
-        }
-        
-        if optimization_method not in optimizers:
-            raise ValueError(f"Unknown optimization method: {optimization_method}")
-            
-        return optimizers[optimization_method](strategy_class, param_space, n_trials, **kwargs)
-
-    def _evaluate_strategy(self, strategy_class, params: Dict) -> float:
-        """Evaluate strategy with given parameters"""
-        strategy = strategy_class(**params)
-        results = self.backtester.run_backtest(strategy, self.data)
-        
-        # Weighted scoring of multiple metrics
-        sharpe = results['metrics']['sharpe_ratio']
-        drawdown = abs(results['metrics']['max_drawdown'])
-        win_rate = results['metrics']['win_rate']
-        
-        return sharpe * 0.4 + (1-drawdown) * 0.3 + win_rate * 0.3
-
-    def _bayesian_optimization(self, strategy_class, param_space, n_trials, **kwargs):
-        """Enhanced Bayesian optimization"""
+                          n_trials: int = 100) -> Tuple[Dict, float]:
+        """Optimize strategy parameters using Optuna"""
         def objective(trial):
             params = {
                 k: trial.suggest_float(k, v[0], v[1]) 
@@ -105,67 +75,22 @@ class StrategyValidator:
                 else trial.suggest_int(k, v[0], v[1])
                 for k, v in param_space.items()
             }
-            return -self._evaluate_strategy(strategy_class, params)
+            
+            strategy = strategy_class(**params)
+            results = self.backtester.run_backtest(strategy, self.data)
+            
+            # Multi-objective optimization
+            sharpe = results['metrics']['sharpe_ratio']
+            drawdown = abs(results['metrics']['max_drawdown'])
+            consistency = results['metrics']['win_rate']
+            
+            return -1 * (sharpe * 0.4 + (1-drawdown) * 0.3 + consistency * 0.3)
             
         study = optuna.create_study(direction='minimize')
         study.optimize(objective, n_trials=n_trials)
+        
         return study.best_params, -study.best_value
-
-    def _genetic_optimization(self, strategy_class, param_space, n_trials, 
-                            population_size=None, mutation_rate=0.1, **kwargs):
-        """Enhanced genetic algorithm optimization"""
-        population_size = population_size or min(n_trials // 4, 50)
-        generations = n_trials // population_size
         
-        # Initialize population with Latin Hypercube Sampling
-        population = self._initialize_population(param_space, population_size)
-        best_solution = None
-        best_fitness = float('-inf')
-
-        for gen in range(generations):
-            # Parallel fitness evaluation
-            with ProcessPoolExecutor() as executor:
-                fitness_scores = list(executor.map(
-                    lambda p: self._evaluate_strategy(strategy_class, p), 
-                    population
-                ))
-            
-            # Update best solution
-            gen_best_idx = np.argmax(fitness_scores)
-            if fitness_scores[gen_best_idx] > best_fitness:
-                best_fitness = fitness_scores[gen_best_idx]
-                best_solution = population[gen_best_idx]
-            
-            # Evolution
-            population = self._evolve_population(
-                population, 
-                fitness_scores, 
-                param_space, 
-                mutation_rate
-            )
-
-        return best_solution, best_fitness
-
-    def _initialize_population(self, param_space, size):
-        """Initialize population using Latin Hypercube Sampling"""
-        from scipy.stats import qmc
-        
-        sampler = qmc.LatinHypercube(d=len(param_space))
-        samples = sampler.random(n=size)
-        
-        population = []
-        for sample in samples:
-            params = {}
-            for (key, bounds), value in zip(param_space.items(), sample):
-                params[key] = bounds[0] + value * (bounds[1] - bounds[0])
-            population.append(params)
-            
-        return population
-
-    def _evolve_population(self, population, fitness_scores, param_space, mutation_rate):
-        """Evolve population using tournament selection and adaptive mutation"""
-        # ... existing genetic algorithm evolution code ...
-
     def validate_robustness(self, strategy: object) -> Dict:
         """Validate strategy robustness"""
         # Test different market conditions
