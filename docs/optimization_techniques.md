@@ -61,3 +61,48 @@ print(results)
 - Ensures strategy performs well on unseen data
 - Validates robustness across different market conditions
 - Reduces risk of overfitting to a single period
+
+## Advanced Optimization Techniques
+
+### 1. Grid Search
+Systematic search through parameter space with defined intervals.
+
+```python
+param_space = {
+    'atr_period': (10, 30),
+    'volatility_threshold': (0.001, 0.01)
+}
+
+best_params, score = validator.optimize_parameters(
+    strategy_class=YourStrategy,
+    param_space=param_space,
+    method='grid'
+)
+```
+
+### 2. Genetic Algorithm
+Evolutionary approach for complex parameter spaces.
+
+```python
+best_params, score = validator.optimize_parameters(
+    strategy_class=YourStrategy,
+    param_space=param_space,
+    method='genetic',
+    n_trials=50  # generations
+)
+```
+
+### 3. Method Comparison
+
+| Method | Pros | Cons |
+|--------|------|------|
+| Bayesian | Efficient, learns from previous trials | May miss global optimum |
+| Grid Search | Systematic, thorough | Computationally expensive |
+| Genetic | Good for complex spaces | Requires tuning of GA parameters |
+
+## Best Practices
+1. Start with grid search for small parameter spaces
+2. Use Bayesian for larger parameter spaces
+3. Consider genetic algorithms for complex strategies
+4. Validate results across different time periods
+5. Monitor for overfitting
