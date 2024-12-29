@@ -52,6 +52,14 @@ class TradingBot:
             self.tick_buffer = []
             self.scalp_positions = []
             
+            # Add risk management parameters
+            self.max_risk_per_trade = 0.02  # 2% max risk per trade
+            self.max_daily_risk = 0.06      # 6% max daily risk
+            self.daily_loss_limit = 0.05    # 5% max daily loss
+            self.total_daily_risk = 0.0
+            self.daily_loss = 0.0
+            self.last_reset_day = datetime.now().date()
+            
             self.setup_data_handlers()
             logger.info("Trading bot initialized successfully")
             
@@ -140,23 +148,49 @@ class TradingBot:
             logger.error(f"Error processing tick data: {e}")
 
     async def execute_trade(self, trade: Dict) -> bool:
-        """Execute trade using MT5 communication"""
+        """Execute trade with risk management and validation"""
         try:
-            order_type = "BUY" if trade['type'] == 'BUY' else "SELL"
-            result = await self.mt5_comm.send_command(
-                f"OPEN,XAUUSD,{order_type},{trade['size']},{trade['entry']},"
-                f"{trade['stop_loss']},{trade['take_profit']}"
-            )
-            
-            if result:
-                logger.info(f"Trade executed successfully: {trade}")
-                return True
-            else:
-                logger.error("Trade execution failed")
+            # Reset daily metrics if new day
+            current_date = datetime.now().date()
+            if current_date != self.last_reset_day:
+                self.total_daily_risk = 0.0
+                self.daily_loss = 0.0
+                self.last_reset_day = current_date
+
+            # Validate risk limits
+            trade_risk = self.calculate_trade_risk(trade)
+            if not self.validate_risk_limits(trade_risk):
+                logger.warning("Trade rejected: Risk limits exceeded")
                 return False
+
+            # Calculate optimal position size
+            trade['size'] = self.calculate_position_size(trade)
+
+            # Add execution validation
+            if not self.validate_execution_conditions(trade):
+                logger.warning("Trade rejected: Invalid execution conditions")
+                return False
+
+            # Execute through low latency executor
+            executor = LowLatencyExecutor()
+            result = await executor.submit_order({
+                'symbol': trade['symbol'],
+                'volume': trade['size'],
+                'type': mt5.ORDER_TYPE_BUY if trade['type'] == 'BUY' else mt5.ORDER_TYPE_SELL,
+                'price': trade['entry'],
+                'sl': trade['stop_loss'],
+                'tp': trade['take_profit']
+            })
+
+            if result:
+                self.total_daily_risk += trade_risk
+                logger.info(f"Trade executed: {trade}, risk: {trade_risk:.2%}")
+                return True
                 
+            return False
+
         except Exception as e:
-            logger.error(f"Error executing trade: {e}")
+            logger.error(f"Trade execution error: {e}")
             return False
 
     async def close_trade(self, trade: Dict) -> bool:
@@ -462,3 +496,58 @@ class TradingBot:
         self.rl_trader.prepare_environment(historical_data)
         self.rl_trader.train()
         self.last_train_time = time.time()
+
+    def validate_risk_limits(self, trade_risk: float) -> bool:
+        """Validate trade against risk management rules"""
+        # Check individual trade risk
+        if trade_risk > self.max_risk_per_trade:
+            return False
+            
+        # Check daily risk limits
+        if (self.total_daily_risk + trade_risk > self.max_daily_risk or
+            self.daily_loss > self.daily_loss_limit):
+            return False
+            
+        return True
+
+    def calculate_trade_risk(self, trade: Dict) -> float:
+        """Calculate risk for a trade"""
+        entry = trade['entry']
+        stop_loss = trade['stop_loss']
+        position_size = trade['size']
+        
+        risk_amount = abs(entry - stop_loss) * position_size
+        account_value = mt5.account_info().balance
+        
+        return risk_amount / account_value
+
+    def calculate_position_size(self, trade: Dict) -> float:
+        """Calculate position size based on risk management"""
+        entry = trade['entry']
+        stop_loss = trade['stop_loss']
+        risk_amount = self.max_risk_per_trade * mt5.account_info().balance
+        
+        pip_value = self.gold_point
+        stop_distance = abs(entry - stop_loss) / pip_value
+        
+        position_size = risk_amount / stop_distance
+        return min(position_size, self.max_lot)
+
+    def validate_execution_conditions(self, trade: Dict) -> bool:
+        """Validate market conditions for trade execution"""
+        # Check spread
+        symbol_info = mt5.symbol_info(trade['symbol'])
+        if symbol_info.spread > symbol_info.spread_float * 2:
+            return False
+            
+        # Check market volatility
+        volatility = self.volatility_strategy.analyze_volatility(
+            self.get_recent_candles())['atr']
+        if volatility > symbol_info.trade_tick_size * 10:
+            return False
+            
+        # Check economic calendar
+        if not self.check_economic_calendar():
+            return False
+            
+        return True
