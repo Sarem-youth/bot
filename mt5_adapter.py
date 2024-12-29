@@ -2,7 +2,7 @@ import zmq
 import json
 import logging
 from typing import Dict, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 from queue import Queue
 import time
@@ -21,6 +21,68 @@ class MT5Config:
     host: str = "localhost"
     recv_timeout: int = 1000
     magic_number: int = 234000
+    environment: str = "demo"  # demo, live
+    risk_limits: Dict = field(default_factory=lambda: {
+        'max_daily_loss': 1000,
+        'max_position_size': 1.0,
+        'max_slippage': 3,
+        'max_spread': 5
+    })
+    monitoring: Dict = field(default_factory=lambda: {
+        'log_level': 'INFO',
+        'save_ticks': True,
+        'performance_report': True
+    })
+
+class MT5Environment:
+    """Environment-specific configuration and safety checks"""
+    def __init__(self, config: MT5Config):
+        self.config = config
+        self.daily_stats = {
+            'total_loss': 0,
+            'total_trades': 0,
+            'errors': 0
+        }
+        self.logger = self._setup_logger()
+        
+    def _setup_logger(self):
+        logger = logging.getLogger(f"mt5_ea_{self.config.environment}")
+        handler = logging.FileHandler(f"ea_{self.config.environment}.log")
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(self.config.monitoring['log_level'])
+        return logger
+        
+    def check_trading_allowed(self) -> bool:
+        """Verify if trading is allowed based on current conditions"""
+        if self.daily_stats['total_loss'] >= self.config.risk_limits['max_daily_loss']:
+            self.logger.warning("Daily loss limit reached")
+            return False
+            
+        if self.daily_stats['errors'] > 5:
+            self.logger.warning("Too many errors, stopping trading")
+            return False
+            
+        return True
+        
+    def validate_order(self, order: Dict) -> bool:
+        """Validate order parameters"""
+        if order['volume'] > self.config.risk_limits['max_position_size']:
+            self.logger.warning(f"Position size {order['volume']} exceeds limit")
+            return False
+            
+        current_spread = self._get_current_spread(order['symbol'])
+        if current_spread > self.config.risk_limits['max_spread']:
+            self.logger.warning(f"Current spread {current_spread} exceeds limit")
+            return False
+            
+        return True
+        
+    def _get_current_spread(self, symbol: str) -> float:
+        """Get current symbol spread"""
+        tick = mt5.symbol_info_tick(symbol)
+        return (tick.ask - tick.bid) / mt5.symbol_info(symbol).point
 
 class MT5Communication:
     def __init__(self, pipe_name: str = "mt5_bridge"):
@@ -93,6 +155,7 @@ class MT5Adapter:
         self.running = False
         self.message_queue = Queue()
         self.tick_handlers = []
+        self.environment = MT5Environment(config)
         
         # Configure sockets
         self.push_socket.connect(f"tcp://{config.host}:{config.pull_port}")
@@ -143,7 +206,22 @@ class MT5Adapter:
                 
     def open_position(self, symbol: str, order_type: str, volume: float,
                      price: float, sl: float, tp: float) -> bool:
-        """Open a new position"""
+        """Enhanced position opening with safety checks"""
+        if not self.environment.check_trading_allowed():
+            return False
+            
+        order = {
+            'symbol': symbol,
+            'volume': volume,
+            'type': order_type,
+            'price': price,
+            'sl': sl,
+            'tp': tp
+        }
+        
+        if not self.environment.validate_order(order):
+            return False
+            
         command = f"OPEN,{symbol},{order_type},{volume},{price},{sl},{tp}"
         return self._send_command(command)
         
