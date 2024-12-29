@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 import MetaTrader5 as mt5
 from order_execution import LowLatencyExecutor
+from mt5_adapter import MT5Communication
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +16,8 @@ from data_feeds import RealTimeDataManager
 class TradingBot:
     def __init__(self):
         try:
-            # Order execution
-            self.executor = LowLatencyExecutor()
+            # Initialize MT5 communication
+            self.mt5_comm = MT5Communication("mt5_bridge")
             
             # Core components
             self.trend_strategy = GoldTrendStrategy()
@@ -58,6 +59,13 @@ class TradingBot:
             logger.error(f"Error initializing trading bot: {str(e)}")
             raise
 
+    async def setup(self):
+        """Setup MT5 communication and data handlers"""
+        if not await self.mt5_comm.connect():
+            raise Exception("Failed to establish MT5 communication")
+        self.setup_data_handlers()
+        logger.info("Trading bot setup completed")
+
     def setup_data_handlers(self):
         """Setup real-time data handlers"""
         self.data_manager.register_price_callback(self.handle_price_update)
@@ -87,48 +95,82 @@ class TradingBot:
             self.max_lot *= 0.5  # Reduce position size before events
             
     async def run(self, symbol: str):
-        """Main trading loop with improved error handling and recovery"""
-        while True:
-            try:
-                await self.data_manager.start_data_feeds()
-                logger.info(f"Starting trading bot for {symbol}")
+        """Main trading loop with MT5 communication"""
+        try:
+            await self.setup()
+            logger.info(f"Starting trading bot for {symbol}")
+            
+            while True:
+                try:
+                    # Get market data
+                    tick_data = await self.mt5_comm.receive_data()
+                    if tick_data and tick_data.startswith("TICK"):
+                        await self.handle_tick_data(tick_data)
+                    
+                    # Regular market analysis
+                    analysis_result = await self.analyze_market(symbol)
+                    if analysis_result:
+                        await self.execute_trade(analysis_result)
+                        
+                    await asyncio.sleep(0.1)  # Prevent CPU overload
+                    
+                except Exception as e:
+                    logger.error(f"Error in trading loop: {e}")
+                    await asyncio.sleep(5)
+                    
+        except Exception as e:
+            logger.error(f"Critical error in trading bot: {e}")
+        finally:
+            self.mt5_comm.close()
+
+    async def handle_tick_data(self, tick_data: str):
+        """Handle incoming tick data"""
+        try:
+            parts = tick_data.split(',')
+            if len(parts) >= 6:
+                tick = {
+                    'symbol': parts[1],
+                    'bid': float(parts[2]),
+                    'ask': float(parts[3]),
+                    'volume': int(parts[4]),
+                    'time': int(parts[5])
+                }
+                await self.process_tick(tick)
+        except Exception as e:
+            logger.error(f"Error processing tick data: {e}")
+
+    async def execute_trade(self, trade: Dict) -> bool:
+        """Execute trade using MT5 communication"""
+        try:
+            order_type = "BUY" if trade['type'] == 'BUY' else "SELL"
+            result = await self.mt5_comm.send_command(
+                f"OPEN,XAUUSD,{order_type},{trade['size']},{trade['entry']},"
+                f"{trade['stop_loss']},{trade['take_profit']}"
+            )
+            
+            if result:
+                logger.info(f"Trade executed successfully: {trade}")
+                return True
+            else:
+                logger.error("Trade execution failed")
+                return False
                 
-                while True:
-                    try:
-                        # Market analysis with timeout protection
-                        analysis_task = asyncio.create_task(
-                            self.analyze_market(symbol)
-                        )
-                        analysis_result = await asyncio.wait_for(
-                            analysis_task, 
-                            timeout=5.0
-                        )
-                        
-                        if analysis_result:
-                            await self.execute_trades(analysis_result)
-                            
-                        # Process real-time data
-                        recent_ticks = self.data_manager.get_recent_ticks()
-                        if recent_ticks:
-                            self.update_strategies(recent_ticks)
-                            
-                        await asyncio.sleep(1)
-                        
-                    except asyncio.TimeoutError:
-                        logger.warning("Market analysis timeout, retrying...")
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error in trading loop: {str(e)}")
-                        await asyncio.sleep(5)  # Backoff before retry
-                        
-            except Exception as e:
-                logger.error(f"Critical error, attempting restart: {str(e)}")
-                await self.data_manager.stop()
-                await asyncio.sleep(30)  # Longer backoff before full restart
-                
-            finally:
-                await self.data_manager.stop()
-        
+        except Exception as e:
+            logger.error(f"Error executing trade: {e}")
+            return False
+
+    async def close_trade(self, trade: Dict) -> bool:
+        """Close trade using MT5 communication"""
+        try:
+            result = await self.mt5_comm.send_command(f"CLOSE,{trade['ticket']}")
+            if result:
+                logger.info(f"Trade closed successfully: {trade['ticket']}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error closing trade: {e}")
+            return False
+
     def process_tick(self, tick_data: Dict):
         """Process incoming tick data"""
         current_time = time.time()
