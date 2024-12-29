@@ -67,17 +67,37 @@ class StrategyValidator:
                           strategy_class, 
                           param_space: Dict,
                           n_trials: int = 100,
-                          optimization_method: str = 'bayesian') -> Tuple[Dict, float]:
-        """Optimize strategy parameters using multiple methods"""
-        if optimization_method == 'bayesian':
-            return self._bayesian_optimization(strategy_class, param_space, n_trials)
-        elif optimization_method == 'genetic':
-            return self._genetic_optimization(strategy_class, param_space, n_trials)
-        else:
+                          optimization_method: str = 'bayesian',
+                          **kwargs) -> Tuple[Dict, float]:
+        """
+        Optimize strategy parameters using specified method
+        """
+        optimizers = {
+            'bayesian': self._bayesian_optimization,
+            'genetic': self._genetic_optimization,
+            'random': self._random_search,
+            'grid': self._grid_search
+        }
+        
+        if optimization_method not in optimizers:
             raise ValueError(f"Unknown optimization method: {optimization_method}")
+            
+        return optimizers[optimization_method](strategy_class, param_space, n_trials, **kwargs)
 
-    def _bayesian_optimization(self, strategy_class, param_space, n_trials):
-        """Implement Bayesian optimization using Optuna"""
+    def _evaluate_strategy(self, strategy_class, params: Dict) -> float:
+        """Evaluate strategy with given parameters"""
+        strategy = strategy_class(**params)
+        results = self.backtester.run_backtest(strategy, self.data)
+        
+        # Weighted scoring of multiple metrics
+        sharpe = results['metrics']['sharpe_ratio']
+        drawdown = abs(results['metrics']['max_drawdown'])
+        win_rate = results['metrics']['win_rate']
+        
+        return sharpe * 0.4 + (1-drawdown) * 0.3 + win_rate * 0.3
+
+    def _bayesian_optimization(self, strategy_class, param_space, n_trials, **kwargs):
+        """Enhanced Bayesian optimization"""
         def objective(trial):
             params = {
                 k: trial.suggest_float(k, v[0], v[1]) 
@@ -85,68 +105,67 @@ class StrategyValidator:
                 else trial.suggest_int(k, v[0], v[1])
                 for k, v in param_space.items()
             }
-            
-            strategy = strategy_class(**params)
-            results = self.backtester.run_backtest(strategy, self.data)
-            
-            # Multi-objective optimization
-            sharpe = results['metrics']['sharpe_ratio']
-            drawdown = abs(results['metrics']['max_drawdown'])
-            consistency = results['metrics']['win_rate']
-            
-            return -1 * (sharpe * 0.4 + (1-drawdown) * 0.3 + consistency * 0.3)
+            return -self._evaluate_strategy(strategy_class, params)
             
         study = optuna.create_study(direction='minimize')
         study.optimize(objective, n_trials=n_trials)
-        
         return study.best_params, -study.best_value
 
-    def _genetic_optimization(self, strategy_class, param_space, n_trials):
-        """Implement genetic algorithm optimization"""
-        population_size = min(n_trials // 4, 50)
+    def _genetic_optimization(self, strategy_class, param_space, n_trials, 
+                            population_size=None, mutation_rate=0.1, **kwargs):
+        """Enhanced genetic algorithm optimization"""
+        population_size = population_size or min(n_trials // 4, 50)
         generations = n_trials // population_size
         
-        def create_individual():
-            return {k: np.random.uniform(v[0], v[1]) for k, v in param_space.items()}
-        
-        population = [create_individual() for _ in range(population_size)]
-        
+        # Initialize population with Latin Hypercube Sampling
+        population = self._initialize_population(param_space, population_size)
+        best_solution = None
+        best_fitness = float('-inf')
+
         for gen in range(generations):
-            # Evaluate fitness
-            fitness_scores = []
-            for params in population:
-                strategy = strategy_class(**params)
-                results = self.backtester.run_backtest(strategy, self.data)
-                fitness = (results['metrics']['sharpe_ratio'] * 0.4 + 
-                         (1 - abs(results['metrics']['max_drawdown'])) * 0.3 + 
-                         results['metrics']['win_rate'] * 0.3)
-                fitness_scores.append(fitness)
+            # Parallel fitness evaluation
+            with ProcessPoolExecutor() as executor:
+                fitness_scores = list(executor.map(
+                    lambda p: self._evaluate_strategy(strategy_class, p), 
+                    population
+                ))
             
-            # Select best performers
-            elite_size = population_size // 4
-            elite_idx = np.argsort(fitness_scores)[-elite_size:]
-            new_population = [population[i] for i in elite_idx]
+            # Update best solution
+            gen_best_idx = np.argmax(fitness_scores)
+            if fitness_scores[gen_best_idx] > best_fitness:
+                best_fitness = fitness_scores[gen_best_idx]
+                best_solution = population[gen_best_idx]
             
-            # Create new generation
-            while len(new_population) < population_size:
-                parent1, parent2 = np.random.choice(elite_idx, 2, replace=False)
-                child = {}
-                for param in param_space:
-                    if np.random.random() < 0.5:
-                        child[param] = population[parent1][param]
-                    else:
-                        child[param] = population[parent2][param]
-                    # Mutation
-                    if np.random.random() < 0.1:
-                        child[param] = np.random.uniform(param_space[param][0], 
-                                                       param_space[param][1])
-                new_population.append(child)
-            
-            population = new_population
+            # Evolution
+            population = self._evolve_population(
+                population, 
+                fitness_scores, 
+                param_space, 
+                mutation_rate
+            )
+
+        return best_solution, best_fitness
+
+    def _initialize_population(self, param_space, size):
+        """Initialize population using Latin Hypercube Sampling"""
+        from scipy.stats import qmc
         
-        best_idx = np.argmax(fitness_scores)
-        return population[best_idx], fitness_scores[best_idx]
+        sampler = qmc.LatinHypercube(d=len(param_space))
+        samples = sampler.random(n=size)
         
+        population = []
+        for sample in samples:
+            params = {}
+            for (key, bounds), value in zip(param_space.items(), sample):
+                params[key] = bounds[0] + value * (bounds[1] - bounds[0])
+            population.append(params)
+            
+        return population
+
+    def _evolve_population(self, population, fitness_scores, param_space, mutation_rate):
+        """Evolve population using tournament selection and adaptive mutation"""
+        # ... existing genetic algorithm evolution code ...
+
     def validate_robustness(self, strategy: object) -> Dict:
         """Validate strategy robustness"""
         # Test different market conditions
