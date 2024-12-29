@@ -66,8 +66,18 @@ class StrategyValidator:
     def optimize_parameters(self, 
                           strategy_class, 
                           param_space: Dict,
-                          n_trials: int = 100) -> Tuple[Dict, float]:
-        """Optimize strategy parameters using Optuna"""
+                          n_trials: int = 100,
+                          optimization_method: str = 'bayesian') -> Tuple[Dict, float]:
+        """Optimize strategy parameters using multiple methods"""
+        if optimization_method == 'bayesian':
+            return self._bayesian_optimization(strategy_class, param_space, n_trials)
+        elif optimization_method == 'genetic':
+            return self._genetic_optimization(strategy_class, param_space, n_trials)
+        else:
+            raise ValueError(f"Unknown optimization method: {optimization_method}")
+
+    def _bayesian_optimization(self, strategy_class, param_space, n_trials):
+        """Implement Bayesian optimization using Optuna"""
         def objective(trial):
             params = {
                 k: trial.suggest_float(k, v[0], v[1]) 
@@ -90,6 +100,52 @@ class StrategyValidator:
         study.optimize(objective, n_trials=n_trials)
         
         return study.best_params, -study.best_value
+
+    def _genetic_optimization(self, strategy_class, param_space, n_trials):
+        """Implement genetic algorithm optimization"""
+        population_size = min(n_trials // 4, 50)
+        generations = n_trials // population_size
+        
+        def create_individual():
+            return {k: np.random.uniform(v[0], v[1]) for k, v in param_space.items()}
+        
+        population = [create_individual() for _ in range(population_size)]
+        
+        for gen in range(generations):
+            # Evaluate fitness
+            fitness_scores = []
+            for params in population:
+                strategy = strategy_class(**params)
+                results = self.backtester.run_backtest(strategy, self.data)
+                fitness = (results['metrics']['sharpe_ratio'] * 0.4 + 
+                         (1 - abs(results['metrics']['max_drawdown'])) * 0.3 + 
+                         results['metrics']['win_rate'] * 0.3)
+                fitness_scores.append(fitness)
+            
+            # Select best performers
+            elite_size = population_size // 4
+            elite_idx = np.argsort(fitness_scores)[-elite_size:]
+            new_population = [population[i] for i in elite_idx]
+            
+            # Create new generation
+            while len(new_population) < population_size:
+                parent1, parent2 = np.random.choice(elite_idx, 2, replace=False)
+                child = {}
+                for param in param_space:
+                    if np.random.random() < 0.5:
+                        child[param] = population[parent1][param]
+                    else:
+                        child[param] = population[parent2][param]
+                    # Mutation
+                    if np.random.random() < 0.1:
+                        child[param] = np.random.uniform(param_space[param][0], 
+                                                       param_space[param][1])
+                new_population.append(child)
+            
+            population = new_population
+        
+        best_idx = np.argmax(fitness_scores)
+        return population[best_idx], fitness_scores[best_idx]
         
     def validate_robustness(self, strategy: object) -> Dict:
         """Validate strategy robustness"""
