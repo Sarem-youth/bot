@@ -197,6 +197,93 @@ class DataProcessor:
             'volume': RobustScaler(),
             'technical': MinMaxScaler()
         }
+        self.scalers['gold_specific'] = {
+            'xau_usd_ratio': StandardScaler(),
+            'real_rates': StandardScaler(),
+            'dollar_index': StandardScaler()
+        }
+
+    def validate_gold_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Validate gold-specific data"""
+        # Check for extreme price movements (more than 5% in a single period)
+        price_changes = data['close'].pct_change()
+        suspicious_moves = abs(price_changes) > 0.05
+        
+        if suspicious_moves.any():
+            warnings.warn(f"Found {suspicious_moves.sum()} suspicious price movements")
+            # Interpolate suspicious values
+            data.loc[suspicious_moves, 'close'] = data['close'].interpolate(method='time')
+        
+        # Validate trading hours (gold trades 23/5)
+        data['hour'] = pd.to_datetime(data['timestamp']).dt.hour
+        invalid_hours = data[~data['hour'].between(0, 23)]
+        if not invalid_hours.empty:
+            warnings.warn(f"Found {len(invalid_hours)} records outside trading hours")
+            data = data[data['hour'].between(0, 23)]
+            
+        # Check for minimum tick size (0.01 for gold)
+        invalid_ticks = data['close'].apply(lambda x: len(str(x).split('.')[-1])) > 2
+        if invalid_ticks.any():
+            data.loc[invalid_ticks, 'close'] = data.loc[invalid_ticks, 'close'].round(2)
+            
+        return data.drop('hour', axis=1)
+
+    def load_historical_data(self, timeframe: str, start_date: str, 
+                           end_date: str, sources: List[str]) -> pd.DataFrame:
+        """Load and combine historical data from multiple sources"""
+        all_data = []
+        
+        for source in sources:
+            try:
+                if source == 'local':
+                    data = self._load_local_data(timeframe, start_date, end_date)
+                elif source == 'api':
+                    data = self._load_api_data(timeframe, start_date, end_date)
+                elif source == 'broker':
+                    data = self._load_broker_data(timeframe, start_date, end_date)
+                    
+                if data is not None:
+                    all_data.append(data)
+            except Exception as e:
+                warnings.warn(f"Error loading data from {source}: {str(e)}")
+                
+        if not all_data:
+            raise ValueError("No data could be loaded from any source")
+            
+        # Combine and validate data
+        combined_data = pd.concat(all_data).drop_duplicates()
+        combined_data = self.validate_gold_data(combined_data)
+        
+        return combined_data
+
+    def resample_data(self, data: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
+        """Resample data to target timeframe"""
+        # Map timeframe strings to pandas offset aliases
+        timeframe_map = {
+            'tick': '1ms',
+            '1m': '1min',
+            '5m': '5min',
+            '15m': '15min',
+            '1h': '1H',
+            '4h': '4H',
+            'D': 'D'
+        }
+        
+        if target_timeframe not in timeframe_map:
+            raise ValueError(f"Unsupported timeframe: {target_timeframe}")
+            
+        resampled = data.resample(
+            timeframe_map[target_timeframe],
+            on='timestamp'
+        ).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        
+        return resampled
 
     @jit(nopython=True)
     def _calculate_vwap(self, prices: np.ndarray, volumes: np.ndarray) -> float:

@@ -16,6 +16,34 @@ class BacktestEngine:
         self.win_rate = 0
         self.profit_factor = 0
         self.sharpe_ratio = 0
+        self.trading_costs = {
+            'spread': 0.03,  # Average gold spread in USD
+            'commission': 0.0001,  # 0.01% commission
+            'swap_long': -0.0002,  # Overnight swap rates
+            'swap_short': -0.0001
+        }
+        self.tick_size = 0.01  # Minimum price movement for gold
+        self.contract_size = 100  # Standard gold contract size (oz)
+        self.market_conditions = {
+            'volatility': {
+                'high': [],
+                'low': []
+            },
+            'trend': {
+                'up': [],
+                'down': [],
+                'sideways': []
+            },
+            'events': {
+                'crisis': [
+                    ('2020-02-20', '2020-04-30', 'COVID-19 Crisis'),
+                    ('2022-02-24', '2022-05-31', 'Russia-Ukraine Conflict')
+                ],
+                'rate_changes': [
+                    ('2022-03-16', '2022-12-31', 'Fed Rate Hikes')
+                ]
+            }
+        }
         
     def run_backtest(self, 
                      strategy: object, 
@@ -164,3 +192,199 @@ class BacktestEngine:
         """Calculate unrealized profit/loss"""
         multiplier = 1 if position['type'] == 'BUY' else -1
         return (current_price - position['entry_price']) * position['size'] * multiplier
+
+    def _calculate_trading_costs(self, position: Dict, current_price: float) -> float:
+        """Calculate total trading costs"""
+        spread_cost = self.trading_costs['spread'] * position['size']
+        commission = current_price * position['size'] * self.trading_costs['commission']
+        
+        # Calculate swap if position held overnight
+        days_held = (datetime.now() - position['entry_time']).days
+        swap_rate = self.trading_costs['swap_long'] if position['type'] == 'BUY' else self.trading_costs['swap_short']
+        swap_cost = days_held * swap_rate * position['size'] * current_price
+        
+        return spread_cost + commission + swap_cost
+
+    def run_multiperiod_test(self, 
+                           strategy: object,
+                           data: pd.DataFrame,
+                           periods: List[str]) -> Dict:
+        """Run backtest across different market periods"""
+        results = {}
+        
+        # Define market periods (e.g., bull, bear, sideways)
+        market_periods = {
+            'bull': ('2019-01-01', '2020-08-01'),
+            'bear': ('2020-08-01', '2021-03-01'),
+            'sideways': ('2021-03-01', '2021-12-31')
+        }
+        
+        for period_name, (start, end) in market_periods.items():
+            period_data = data[(data['time'] >= start) & (data['time'] <= end)]
+            results[period_name] = self.run_backtest(
+                strategy,
+                period_data,
+                datetime.strptime(start, '%Y-%m-%d'),
+                datetime.strptime(end, '%Y-%m-%d')
+            )
+            
+        return results
+
+    def analyze_market_conditions(self, data: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """Identify different market conditions in the data"""
+        conditions = {}
+        
+        # Volatility analysis
+        returns = data['close'].pct_change()
+        volatility = returns.rolling(window=20).std() * np.sqrt(252)
+        vol_threshold = volatility.mean() + volatility.std()
+        
+        conditions['high_volatility'] = data[volatility > vol_threshold]
+        conditions['low_volatility'] = data[volatility <= vol_threshold]
+        
+        # Trend analysis
+        sma_short = data['close'].rolling(window=20).mean()
+        sma_long = data['close'].rolling(window=50).mean()
+        adx = self._calculate_adx(data, period=14)
+        
+        conditions['trending_up'] = data[(sma_short > sma_long) & (adx > 25)]
+        conditions['trending_down'] = data[(sma_short < sma_long) & (adx > 25)]
+        conditions['ranging'] = data[adx <= 25]
+        
+        return conditions
+
+    def _calculate_adx(self, data: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average Directional Index"""
+        high = data['high']
+        low = data['low']
+        close = data['close']
+        
+        plus_dm = high.diff()
+        minus_dm = low.diff()
+        tr = pd.DataFrame({
+            'hl': high - low,
+            'hc': abs(high - close.shift(1)),
+            'lc': abs(low - close.shift(1))
+        }).max(axis=1)
+        
+        tr_smoothed = tr.rolling(period).sum()
+        plus_dm_smoothed = plus_dm.clip(lower=0).rolling(period).sum()
+        minus_dm_smoothed = minus_dm.clip(upper=0).abs().rolling(period).sum()
+        
+        plus_di = 100 * plus_dm_smoothed / tr_smoothed
+        minus_di = 100 * minus_dm_smoothed / tr_smoothed
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        
+        return dx.rolling(period).mean()
+
+    def evaluate_market_conditions(self, 
+                                strategy: object,
+                                data: pd.DataFrame) -> Dict:
+        """Evaluate strategy performance under different market conditions"""
+        conditions = self.analyze_market_conditions(data)
+        results = {}
+        
+        for condition, condition_data in conditions.items():
+            if len(condition_data) > 0:
+                results[condition] = self.run_backtest(
+                    strategy,
+                    condition_data,
+                    condition_data.index[0],
+                    condition_data.index[-1]
+                )
+                
+        return self._analyze_condition_performance(results)
+
+    def _analyze_condition_performance(self, results: Dict) -> Dict:
+        """Analyze performance across different conditions"""
+        analysis = {}
+        
+        for condition, result in results.items():
+            metrics = result['metrics']
+            analysis[condition] = {
+                'sharpe_ratio': metrics['sharpe_ratio'],
+                'win_rate': metrics['win_rate'],
+                'profit_factor': metrics['profit_factor'],
+                'max_drawdown': metrics['max_drawdown'],
+                'total_trades': metrics['total_trades']
+            }
+            
+        # Calculate condition-specific metrics
+        analysis['volatility_stability'] = self._calculate_stability_score(
+            analysis.get('high_volatility', {}),
+            analysis.get('low_volatility', {})
+        )
+        
+        analysis['trend_adaptation'] = self._calculate_adaptation_score(
+            analysis.get('trending_up', {}),
+            analysis.get('trending_down', {}),
+            analysis.get('ranging', {})
+        )
+        
+        return analysis
+
+    def _calculate_stability_score(self, high_vol: Dict, low_vol: Dict) -> float:
+        """Calculate strategy stability across volatility regimes"""
+        if not high_vol or not low_vol:
+            return 0.0
+            
+        return 1 - abs(
+            high_vol.get('sharpe_ratio', 0) - 
+            low_vol.get('sharpe_ratio', 0)
+        ) / max(
+            abs(high_vol.get('sharpe_ratio', 1)), 
+            abs(low_vol.get('sharpe_ratio', 1))
+        )
+
+    def _calculate_adaptation_score(self, up: Dict, down: Dict, ranging: Dict) -> float:
+        """Calculate strategy adaptation to different trends"""
+        scores = []
+        
+        for condition in [up, down, ranging]:
+            if condition:
+                scores.append(
+                    condition.get('win_rate', 0) * 
+                    condition.get('profit_factor', 0)
+                )
+                
+        return np.mean(scores) if scores else 0.0
+
+    def stress_test_strategy(self, 
+                           strategy: object,
+                           data: pd.DataFrame,
+                           scenarios: List[Dict]) -> Dict:
+        """Stress test strategy under different scenarios"""
+        results = {}
+        
+        for scenario in scenarios:
+            # Apply scenario modifications to data
+            scenario_data = self._apply_scenario(data.copy(), scenario)
+            
+            # Run backtest with modified data
+            scenario_results = self.run_backtest(
+                strategy,
+                scenario_data,
+                scenario_data.index[0],
+                scenario_data.index[-1]
+            )
+            
+            results[scenario['name']] = {
+                'metrics': scenario_results['metrics'],
+                'max_adverse_excursion': self._calculate_mae(scenario_results['trades']),
+                'recovery_time': self._calculate_recovery_time(scenario_results['equity_curve'])
+            }
+            
+        return results
+
+    def _apply_scenario(self, data: pd.DataFrame, scenario: Dict) -> pd.DataFrame:
+        """Apply stress test scenario to data"""
+        if scenario['type'] == 'volatility_shock':
+            data['high'] += data['high'] * scenario['magnitude']
+            data['low'] -= data['low'] * scenario['magnitude']
+        elif scenario['type'] == 'gap':
+            idx = data.index[len(data)//2]  # Apply gap in middle of data
+            data.loc[idx:, ['open', 'high', 'low', 'close']] *= (1 + scenario['magnitude'])
+        elif scenario['type'] == 'liquidity_crisis':
+            data['volume'] *= scenario['magnitude']
+            
+        return data
