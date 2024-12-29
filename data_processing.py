@@ -419,3 +419,45 @@ class RealTimeProcessor:
                 self.tick_buffer[-self.config.window_size:]
             )
         return None
+
+    async def process_streaming_data(self, tick_data):
+        """Process new tick data in real-time"""
+        processed_tick = self.calculate_real_time_features(tick_data)
+        if self.validate_real_time_data(tick_data):
+            # Add to batch and process if batch is ready
+            self.tick_batch.append(processed_tick)
+            if len(self.tick_batch) >= self.config.batch_size:
+                return await self.process_tick_batch(self.tick_batch)
+        return None
+
+    def calculate_real_time_features(self, tick_data):
+        processor = DataProcessor()
+        processed_tick = processor.process_tick({
+            'time': tick_data['timestamp'],
+            'bid': tick_data['bid'],
+            'ask': tick_data['ask'],
+            'volume': tick_data['volume']
+        })
+        return processed_tick
+
+    def validate_real_time_data(self, tick_data):
+        if tick_data['bid'] <= 0 or tick_data['ask'] <= 0:
+            return False
+        spread = tick_data['ask'] - tick_data['bid']
+        if spread > 1.0:
+            return False
+        if tick_data['timestamp'] < self.last_tick_time:
+            return False
+        return True
+
+    async def process_tick_batch(self, tick_batch):
+        try:
+            features = self.prepare_ml_features(tick_batch)
+            sequences = self.create_sequences(features, self.config.window_size)
+            return {
+                'features': features,
+                'sequences': sequences
+            }
+        except Exception as e:
+            logger.error(f"Error processing tick batch: {e}")
+            return None
