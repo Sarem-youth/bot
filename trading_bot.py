@@ -1,206 +1,305 @@
-from ml_model import GoldPricePredictor
-import numpy as np
+# ...existing code...
+
+from strategies import GoldTrendStrategy, RangeBoundStrategy, EventStrategy, VolatilityStrategy
+from ml_model import GoldPricePredictor, RLTrader
 
 class TradingBot:
     def __init__(self):
         # ...existing code...
-        self.adaptive_periods = {
-            'slow': 50,
-            'medium': 21,
-            'fast': 9
-        }
+        self.trend_strategy = GoldTrendStrategy()
+        self.range_strategy = RangeBoundStrategy()
         self.volatility_multiplier = 1.0
-        self.adx_period = 14
-        self.adx_threshold = 25
+        self.event_strategy = EventStrategy()
+        self.last_event_check = None
+        self.event_check_interval = 300  # 5 minutes
+        self.volatility_strategy = VolatilityStrategy()
+        self.tick_enabled = True
         self.tick_buffer = []
-        self.tick_buffer_size = 1000
-        self.ml_model = GoldPricePredictor()
-        self.model_path = 'models/gold_predictor.joblib'
-        self.training_data = []
-        self.min_training_samples = 1000
-        # ...existing code...
-
-    def calculate_adaptive_ma(self, prices, volatility_index):
-        """Calculate Adaptive Moving Average based on market volatility"""
-        alpha = min(1.0, max(0.1, volatility_index / 100))
-        ma = [prices[0]]
-        for i in range(1, len(prices)):
-            ma.append(alpha * prices[i] + (1 - alpha) * ma[i-1])
-        return ma
-
-    def check_adx_trend(self, candles):
-        """Calculate ADX for trend strength confirmation"""
-        highs = [candle[2] for candle in candles]
-        lows = [candle[3] for candle in candles]
-        closes = [candle[4] for candle in candles]
+        self.last_tick_time = None
+        self.min_tick_interval = 0.1  # Minimum seconds between tick processing
+        self.scalp_positions = []
+        self.price_predictor = GoldPricePredictor()
+        self.rl_trader = RLTrader()
+        self.ml_enabled = True
+        self.model_retrain_interval = 24 * 60 * 60  # 24 hours
+        self.last_train_time = None
         
-        # Calculate +DI and -DI
-        plus_dm = np.zeros(len(candles))
-        minus_dm = np.zeros(len(candles))
+    def process_tick(self, tick_data: Dict):
+        """Process incoming tick data"""
+        current_time = time.time()
         
-        for i in range(1, len(candles)):
-            up_move = highs[i] - highs[i-1]
-            down_move = lows[i-1] - lows[i]
+        # Rate limiting for tick processing
+        if (self.last_tick_time and 
+            current_time - self.last_tick_time < self.min_tick_interval):
+            return
             
-            if up_move > down_move and up_move > 0:
-                plus_dm[i] = up_move
-            if down_move > up_move and down_move > 0:
-                minus_dm[i] = down_move
+        self.last_tick_time = current_time
+        self.trend_strategy.last_tick = tick_data
         
-        tr = self.calculate_tr(highs, lows, closes)
+        # Quick scalping analysis
+        if self.tick_enabled:
+            scalp_analysis = self.trend_strategy.scalping_strategy.analyze_tick_data(tick_data)
+            if scalp_analysis['signal']:
+                self.execute_scalp_trade(scalp_analysis)
+                
+    def process_order_book(self, order_book: Dict):
+        """Process order book updates"""
+        self.trend_strategy.order_book = order_book
         
-        # Smooth the indicators
-        smoothed_plus_dm = self.exponential_smooth(plus_dm, self.adx_period)
-        smoothed_minus_dm = self.exponential_smooth(minus_dm, self.adx_period)
-        smoothed_tr = self.exponential_smooth(tr, self.adx_period)
+        if self.tick_enabled:
+            book_analysis = self.trend_strategy.scalping_strategy.analyze_order_book(order_book)
+            # Update active scalp positions
+            self.update_scalp_positions(book_analysis)
+            
+    def execute_scalp_trade(self, analysis: Dict):
+        """Execute a scalping trade"""
+        if len(self.scalp_positions) >= 3:  # Maximum concurrent scalp trades
+            return
+            
+        # Get current price and volatility
+        current_price = self.get_current_price()
+        volatility = self.volatility_strategy.analyze_volatility(
+            self.get_recent_candles())['atr']
+            
+        # Calculate trade levels
+        levels = self.trend_strategy.scalping_strategy.get_optimal_scalp_levels(
+            current_price, volatility)
+            
+        # Execute trade with tight stops
+        if analysis['signal'] == 'BUY':
+            stop_loss = current_price - levels['stop_loss']
+            take_profit = current_price + levels['take_profit']
+        else:
+            stop_loss = current_price + levels['stop_loss']
+            take_profit = current_price - levels['take_profit']
+            
+        # Use smaller position size for scalping
+        position_size = self.max_lot * 0.3
         
-        plus_di = (smoothed_plus_dm / smoothed_tr) * 100
-        minus_di = (smoothed_minus_dm / smoothed_tr) * 100
+        trade = {
+            'type': analysis['signal'],
+            'entry': current_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'size': position_size,
+            'start_time': time.time(),
+            'timeout': levels['timeout']
+        }
         
-        # Calculate ADX
-        dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
-        adx = self.exponential_smooth(dx, self.adx_period)
+        self.scalp_positions.append(trade)
+        self.execute_trade(trade)
         
-        return adx[-1], plus_di[-1], minus_di[-1]
-
+    def update_scalp_positions(self, book_analysis: Dict):
+        """Update and manage scalping positions"""
+        current_time = time.time()
+        current_price = self.get_current_price()
+        
+        for position in self.scalp_positions[:]:  # Copy list for safe removal
+            # Check timeout
+            if current_time - position['start_time'] > position['timeout']:
+                self.close_trade(position)
+                self.scalp_positions.remove(position)
+                continue
+                
+            # Dynamic exit based on order book pressure
+            if (position['type'] == 'BUY' and book_analysis['imbalance'] < -0.3 or
+                position['type'] == 'SELL' and book_analysis['imbalance'] > 0.3):
+                self.close_trade(position)
+                self.scalp_positions.remove(position)
+                
     def analyze_market(self, symbol):
         try:
-            # ...existing code...
+            # Check if models need retraining
+            if (self.ml_enabled and 
+                (self.last_train_time is None or 
+                 time.time() - self.last_train_time > self.model_retrain_interval)):
+                historical_data = self.get_historical_data(symbol, mt5.TIMEFRAME_H1, 0, 1000)
+                self.train_models(historical_data)
             
-            # Enhanced market analysis with new strategies
-            adx, plus_di, minus_di = self.check_adx_trend(m15_candles)
-            
-            # Add volatility-based adjustments
-            atr = self.calculate_atr(m15_candles)
-            self.volatility_multiplier = min(2.0, max(0.5, atr / self.gold_point))
-            
-            # Adjust strategy parameters based on volatility
-            if self.volatility_multiplier > 1.5:
-                self.rsi_buy_threshold = 35  # More aggressive in volatile markets
-                self.rsi_sell_threshold = 65
-            else:
-                self.rsi_buy_threshold = 40  # More conservative in calm markets
-                self.rsi_sell_threshold = 60
+            # Check events periodically
+            current_time = time.time()
+            if (self.last_event_check is None or 
+                current_time - self.last_event_check > self.event_check_interval):
+                event_analysis = self.event_strategy.analyze_events()
+                self.last_event_check = current_time
                 
-            # Apply adaptive moving averages
-            closes = [candle[4] for candle in m15_candles]
-            adaptive_ma = self.calculate_adaptive_ma(closes, self.volatility_multiplier * 100)
-            
-            # Enhanced signal validation
-            signals = []
-            if adx > self.adx_threshold:
-                if plus_di > minus_di:
-                    signals.append({'type': 'BUY', 'strategy': 'ADX', 'strength': 1.5})
-                else:
-                    signals.append({'type': 'SELL', 'strategy': 'ADX', 'strength': 1.5})
-            
-            # Add existing signal checks
-            # ...existing code...
-            
-            # Machine learning prediction if model is available
-            if self.ml_model:
-                prediction = self.get_ml_prediction(m15_candles)
-                if prediction is not None:
+                # Adjust position sizing based on pending events
+                if event_analysis['pending_events'] > 0:
+                    self.max_lot *= 0.5  # Reduce position size before major events
+                    
+                # Add event signals
+                if event_analysis['signal']:
                     signals.append({
-                        'type': 'BUY' if prediction > 0 else 'SELL',
-                        'strategy': 'ML',
-                        'strength': abs(prediction)
+                        'type': event_analysis['signal'],
+                        'strategy': 'EVENT',
+                        'strength': event_analysis['strength']
                     })
+                    
+                    # Adjust stop loss for event-based trades
+                    if abs(event_analysis['sentiment']) > 0.5:
+                        self.min_pip_movement *= 1.5  # Wider stops for high-impact events
             
-            # Collect training data
-            self.collect_training_data(m15_candles[-1])
+            # ...existing code until signals list...
             
-            # Get ML prediction if model is trained
-            if self.ml_model.trained:
-                prediction = self.get_ml_prediction(m15_candles)
-                if prediction is not None:
+            # Add trend strategy signals
+            trend_analysis = self.trend_strategy.analyze_trend(m15_candles)
+            if trend_analysis['signal']:
+                signals.append({
+                    'type': trend_analysis['signal'],
+                    'strategy': 'TREND',
+                    'strength': trend_analysis['strength']
+                })
+                
+                # Adjust stop loss and take profit based on volatility
+                self.volatility_multiplier = max(1.0, trend_analysis['volatility'] * 2)
+                
+            # Add range analysis
+            range_analysis = self.range_strategy.analyze_range(m15_candles)
+            if range_analysis['signal']:
+                signals.append({
+                    'type': range_analysis['signal'],
+                    'strategy': 'RANGE',
+                    'strength': range_analysis['strength']
+                })
+                
+                # Adjust stop loss for range trades
+                if range_analysis['signal'] and trend_analysis['adx'] < 20:
+                    self.min_pip_movement = 10  # Tighter stop loss for range trades
+            
+            # Add volatility analysis
+            volatility_analysis = self.volatility_strategy.analyze_volatility(m15_candles)
+            
+            # Adjust position sizing and stops based on volatility
+            current_atr = volatility_analysis['atr']
+            if current_atr > 0:
+                self.min_pip_movement = max(self.min_pip_movement, current_atr * 0.5)
+                self.max_lot = min(self.max_lot, 
+                                 volatility_analysis['suggested_position_size'])
+                
+            # Add volatility breakout signals
+            if volatility_analysis['signal']:
+                signals.append({
+                    'type': volatility_analysis['signal'],
+                    'strategy': 'VOLATILITY',
+                    'strength': volatility_analysis['strength']
+                })
+                
+            # Add scalping signals if enabled
+            if self.tick_enabled and hasattr(self.trend_strategy, 'last_tick'):
+                scalp_analysis = self.trend_strategy.scalping_strategy.analyze_tick_data(
+                    self.trend_strategy.last_tick)
+                if scalp_analysis['signal']:
                     signals.append({
-                        'type': 'BUY' if prediction > 0 else 'SELL',
-                        'strategy': 'ML',
-                        'strength': abs(prediction)
+                        'type': scalp_analysis['signal'],
+                        'strategy': 'SCALP',
+                        'strength': scalp_analysis['strength']
                     })
+                    
+            # Add ML predictions
+            if self.ml_enabled:
+                # LSTM price prediction
+                price_prediction = self.price_predictor.predict(m15_candles)
+                if price_prediction['signal']:
+                    signals.append({
+                        'type': price_prediction['signal'],
+                        'strategy': 'ML_LSTM',
+                        'strength': price_prediction['confidence'] * 3
+                    })
+                    
+                # RL trading signal
+                rl_prediction = self.rl_trader.predict(m15_candles)
+                if rl_prediction['signal']:
+                    signals.append({
+                        'type': rl_prediction['signal'],
+                        'strategy': 'ML_RL',
+                        'strength': rl_prediction['confidence'] * 2
+                    })
+                    
+            # Modify signal validation
+            if signals:
+                potential_trade = self.validate_signals(signals, m15_candles)
+                if potential_trade:
+                    # Adjust stop loss and take profit based on volatility multiplier
+                    sl_pips = max(self.min_pip_movement, 
+                                self.min_pip_movement * self.volatility_multiplier)
+                    tp_pips = sl_pips * (2.0 if trend_analysis['adx'] > 25 else 1.5)
+                    
+                    # Dynamic stop loss based on ATR
+                    sl_pips = max(self.min_pip_movement, current_atr * 2)
+                    tp_pips = sl_pips * (2.5 if volatility_analysis['volatility'] < 0.1 else 1.5)
+                    
+                    potential_trade['stop_loss'] = (current_price - 
+                        (sl_pips * self.gold_point if potential_trade['type'] == 'BUY' 
+                         else -sl_pips * self.gold_point))
+                    potential_trade['take_profit'] = (current_price + 
+                        (tp_pips * self.gold_point if potential_trade['type'] == 'BUY' 
+                         else -tp_pips * self.gold_point))
+                    
+                    return potential_trade
             
-            return self.validate_signals(signals, m15_candles)
+            # ...rest of existing code...
             
-        except Exception as e:
-            print(f"Error in analyze_market: {str(e)}")
-            return None
-
-    def get_ml_prediction(self, candles):
-        """Get prediction from machine learning model"""
-        if not self.ml_model:
-            return None
+    def validate_signals(self, signals, candles):
+        # ...existing code...
+        
+        # Add trend strength consideration
+        trend_signals = [s for s in signals if s['strategy'] == 'TREND']
+        if trend_signals:
+            trend_strength = trend_signals[0]['strength']
+            base_lot = min(max(self.min_lot, 
+                             self.min_lot * (1 + trend_strength * 0.1)), 
+                         self.max_lot)
+        
+        # Consider both trend and range signals
+        range_signals = [s for s in signals if s['strategy'] == 'RANGE']
+        
+        # Prioritize range signals in low ADX conditions
+        if range_signals and self.trend_strategy.calculate_adx(
+            [c[2] for c in candles],
+            [c[3] for c in candles],
+            [c[4] for c in candles]
+        )[-1] < 20:
+            base_lot *= 0.8  # Reduce position size for range trades
+        
+        # Consider event signals
+        event_signals = [s for s in signals if s['strategy'] == 'EVENT']
+        if event_signals and event_signals[0]['strength'] >= 2:
+            # Prioritize event signals with high strength
+            base_lot = min(base_lot * 1.2, self.max_lot)  # Increase position size
             
-        # Prepare features
-        features = self.prepare_ml_features(candles)
+        # Consider volatility signals
+        volatility_signals = [s for s in signals if s['strategy'] == 'VOLATILITY']
+        if volatility_signals:
+            volatility_analysis = self.volatility_strategy.analyze_volatility(candles)
+            # Adjust position size based on volatility
+            base_lot *= (1 - volatility_analysis['volatility'])
+            
+        # Consider ML signals
+        ml_signals = [s for s in signals if s['strategy'].startswith('ML_')]
+        if ml_signals:
+            # Increase position size if ML models agree with other signals
+            ml_consensus = all(s['type'] == signals[0]['type'] for s in ml_signals)
+            if ml_consensus:
+                base_lot *= 1.2
+                
+        # ...rest of existing code...
         
-        try:
-            prediction = self.ml_model.predict([features])[0]
-            return prediction
-        except Exception as e:
-            print(f"ML prediction error: {str(e)}")
-            return None
-
-    def prepare_ml_features(self, candles):
-        """Prepare features for ML model"""
-        features = []
-        closes = [candle[4] for candle in candles]
-        
-        # Technical indicators
-        rsi = self.calculate_rsi(closes)[-1]
-        macd, signal = self.calculate_macd(closes)
-        bb_upper, bb_lower = self.calculate_bollinger_bands(closes)
-        
-        features.extend([
-            rsi,
-            macd[-1],
-            signal[-1],
-            (closes[-1] - bb_lower[-1]) / (bb_upper[-1] - bb_lower[-1]),
-            self.volatility_multiplier
-        ])
-        
-        return features
-
-    def train_ml_model(self):
-        """Train or retrain the ML model with accumulated data"""
-        if len(self.training_data) < self.min_training_samples:
-            print(f"Insufficient training data: {len(self.training_data)}/{self.min_training_samples}")
-            return False
-
-        try:
-            scores = self.ml_model.train(self.training_data)
-            print(f"Model trained - Train score: {scores['train_score']:.2f}, Test score: {scores['test_score']:.2f}")
-            self.ml_model.save_model(self.model_path)
+    def check_economic_calendar(self):
+        """Enhanced economic calendar check"""
+        if not self.event_strategy:
             return True
-        except Exception as e:
-            print(f"Error training model: {str(e)}")
-            return False
-
-    def collect_training_data(self, candle):
-        """Collect and preprocess data for ML training"""
-        if not candle:
-            return
-
-        data_point = {
-            'close': candle[4],
-            'rsi': self.calculate_rsi([c[4] for c in self.training_data[-14:] + [candle]])[-1],
-            'macd': self.calculate_macd([c[4] for c in self.training_data[-26:] + [candle]])[0][-1],
-            'bb_width': self.calculate_bb_width(candle),
-            'volatility': self.calculate_volatility(candle)
-        }
-        self.training_data.append(data_point)
-
-        # Train model when sufficient data is collected
-        if len(self.training_data) == self.min_training_samples:
-            self.train_ml_model()
-
-    def calculate_bb_width(self, candle):
-        """Calculate Bollinger Band width"""
-        closes = [c[4] for c in self.training_data[-20:] + [candle]]
-        upper, lower = self.calculate_bollinger_bands(closes)
-        return (upper[-1] - lower[-1]) / closes[-1]
-
-    def calculate_volatility(self, candle):
-        """Calculate local volatility"""
-        returns = [abs(c[4] - c[1]) / c[1] for c in self.training_data[-10:] + [candle]]
-        return np.std(returns)
+            
+        events = self.event_strategy.check_economic_calendar()
+        for event in events:
+            if (event['importance'] == 'high' and 
+                abs(datetime.now() - datetime.fromisoformat(event['time'])) < timedelta(minutes=30)):
+                return False
+        return True
+        
+    def train_models(self, historical_data: list):
+        """Train ML models with historical data"""
+        print("Training ML models...")
+        self.price_predictor.train(historical_data)
+        self.rl_trader.prepare_environment(historical_data)
+        self.rl_trader.train()
+        self.last_train_time = time.time()
