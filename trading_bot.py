@@ -1,4 +1,12 @@
-# ...existing code...
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List
+import MetaTrader5 as mt5
+from order_execution import LowLatencyExecutor
+
+logger = logging.getLogger(__name__)
 
 from strategies import GoldTrendStrategy, RangeBoundStrategy, EventStrategy, VolatilityStrategy
 from ml_model import GoldPricePredictor, RLTrader
@@ -6,27 +14,50 @@ from data_feeds import RealTimeDataManager
 
 class TradingBot:
     def __init__(self):
-        # ...existing code...
-        self.trend_strategy = GoldTrendStrategy()
-        self.range_strategy = RangeBoundStrategy()
-        self.volatility_multiplier = 1.0
-        self.event_strategy = EventStrategy()
-        self.last_event_check = None
-        self.event_check_interval = 300  # 5 minutes
-        self.volatility_strategy = VolatilityStrategy()
-        self.tick_enabled = True
-        self.tick_buffer = []
-        self.last_tick_time = None
-        self.min_tick_interval = 0.1  # Minimum seconds between tick processing
-        self.scalp_positions = []
-        self.price_predictor = GoldPricePredictor()
-        self.rl_trader = RLTrader()
-        self.ml_enabled = True
-        self.model_retrain_interval = 24 * 60 * 60  # 24 hours
-        self.last_train_time = None
-        self.data_manager = RealTimeDataManager()
-        self.setup_data_handlers()
-        
+        try:
+            # Order execution
+            self.executor = LowLatencyExecutor()
+            
+            # Core components
+            self.trend_strategy = GoldTrendStrategy()
+            self.range_strategy = RangeBoundStrategy()
+            self.event_strategy = EventStrategy()
+            self.volatility_strategy = VolatilityStrategy()
+            
+            # Machine learning
+            self.price_predictor = GoldPricePredictor()
+            self.rl_trader = RLTrader()
+            
+            # Data management
+            self.data_manager = RealTimeDataManager()
+            
+            # Trading parameters
+            self.volatility_multiplier = 1.0
+            self.tick_enabled = True
+            self.ml_enabled = True
+            self.gold_point = 0.1  # 1 point for gold
+            self.max_lot = float(os.getenv('MAX_LOT', '1.0'))
+            self.min_lot = float(os.getenv('MIN_LOT', '0.01'))
+            
+            # Operational parameters
+            self.model_retrain_interval = 24 * 60 * 60  # 24 hours
+            self.event_check_interval = 300  # 5 minutes
+            self.min_tick_interval = 0.1  # 100ms
+            
+            # State management
+            self.last_train_time = None
+            self.last_event_check = None
+            self.last_tick_time = None
+            self.tick_buffer = []
+            self.scalp_positions = []
+            
+            self.setup_data_handlers()
+            logger.info("Trading bot initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing trading bot: {str(e)}")
+            raise
+
     def setup_data_handlers(self):
         """Setup real-time data handlers"""
         self.data_manager.register_price_callback(self.handle_price_update)
@@ -56,27 +87,47 @@ class TradingBot:
             self.max_lot *= 0.5  # Reduce position size before events
             
     async def run(self, symbol: str):
-        """Run the trading bot with real-time data"""
-        try:
-            await self.data_manager.start_data_feeds()
-            while True:
-                # Regular market analysis
-                analysis_result = self.analyze_market(symbol)
-                if analysis_result:
-                    await self.execute_trades(analysis_result)
-                    
-                # Process real-time data and update strategies
-                recent_ticks = self.data_manager.get_recent_ticks()
-                if recent_ticks:
-                    self.update_strategies(recent_ticks)
-                    
-                await asyncio.sleep(1)  # Main loop interval
+        """Main trading loop with improved error handling and recovery"""
+        while True:
+            try:
+                await self.data_manager.start_data_feeds()
+                logger.info(f"Starting trading bot for {symbol}")
                 
-        except KeyboardInterrupt:
-            await self.data_manager.stop()
-        except Exception as e:
-            print(f"Error in main loop: {str(e)}")
-            await self.data_manager.stop()
+                while True:
+                    try:
+                        # Market analysis with timeout protection
+                        analysis_task = asyncio.create_task(
+                            self.analyze_market(symbol)
+                        )
+                        analysis_result = await asyncio.wait_for(
+                            analysis_task, 
+                            timeout=5.0
+                        )
+                        
+                        if analysis_result:
+                            await self.execute_trades(analysis_result)
+                            
+                        # Process real-time data
+                        recent_ticks = self.data_manager.get_recent_ticks()
+                        if recent_ticks:
+                            self.update_strategies(recent_ticks)
+                            
+                        await asyncio.sleep(1)
+                        
+                    except asyncio.TimeoutError:
+                        logger.warning("Market analysis timeout, retrying...")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error in trading loop: {str(e)}")
+                        await asyncio.sleep(5)  # Backoff before retry
+                        
+            except Exception as e:
+                logger.error(f"Critical error, attempting restart: {str(e)}")
+                await self.data_manager.stop()
+                await asyncio.sleep(30)  # Longer backoff before full restart
+                
+            finally:
+                await self.data_manager.stop()
         
     def process_tick(self, tick_data: Dict):
         """Process incoming tick data"""
@@ -163,6 +214,9 @@ class TradingBot:
                 
     def analyze_market(self, symbol):
         try:
+            # Initialize signals list
+            signals = []
+
             # Check if models need retraining
             if (self.ml_enabled and 
                 (self.last_train_time is None or 
@@ -170,6 +224,11 @@ class TradingBot:
                 historical_data = self.get_historical_data(symbol, mt5.TIMEFRAME_H1, 0, 1000)
                 self.train_models(historical_data)
             
+            # Get current candles
+            m15_candles = self.get_historical_data(symbol, mt5.TIMEFRAME_M15, 0, 100)
+            if not m15_candles:
+                return None
+
             # Check events periodically
             current_time = time.time()
             if (self.last_event_check is None or 
@@ -292,6 +351,10 @@ class TradingBot:
                     return potential_trade
             
             # ...rest of existing code...
+
+        except Exception as e:
+            logger.error(f"Error in market analysis: {str(e)}")
+            return None
             
     def validate_signals(self, signals, candles):
         # ...existing code...
