@@ -563,6 +563,12 @@ class GoldTradingBot:
             EconomicEventsStrategy
         )
         
+        # Register Volatility Breakout strategy
+        self.plugin_manager.register_strategy(
+            'volatility_breakout',
+            VolatilityBreakoutStrategy
+        )
+        
         # Add ATR Risk Manager
         self.risk_manager = ATRRiskManager()
         
@@ -2279,3 +2285,206 @@ class ATRRiskManager:
                 new_stop += current_atr * 0.5
         
         return new_stop
+
+class VolatilityBreakoutStrategy(Strategy):
+    """Bollinger Bands volatility breakout strategy"""
+    def __init__(self):
+        self.params = {
+            'bb_period': 20,           # Bollinger Bands period
+            'bb_std': 2.0,            # Number of standard deviations
+            'volume_trigger': 1.5,     # Volume increase to confirm breakout
+            'breakout_threshold': 0.001, # 0.1% price movement confirmation
+            'consolidation_periods': 5, # Periods of low volatility needed
+            'volatility_threshold': 0.2, # Threshold for volatility squeeze
+            'scale_out_levels': [0.5, 0.3, 0.2],  # Profit taking levels
+            'stop_atr_multiple': 2.0   # ATR multiple for stop loss
+        }
+        self.position = None
+        self.last_breakout = None
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze price data for volatility breakout setups"""
+        if len(data) < self.params['bb_period']:
+            return {'valid': False}
+            
+        # Calculate Bollinger Bands
+        middle_band = data['close'].rolling(window=self.params['bb_period']).mean()
+        std_dev = data['close'].rolling(window=self.params['bb_period']).std()
+        upper_band = middle_band + (std_dev * self.params['bb_std'])
+        lower_band = middle_band - (std_dev * self.params['bb_std'])
+        
+        # Calculate band width and volatility
+        band_width = (upper_band - lower_band) / middle_band
+        volatility = data['close'].pct_change().rolling(window=self.params['bb_period']).std()
+        
+        # Detect volatility squeeze
+        squeeze = self._detect_squeeze(band_width, volatility)
+        
+        # Calculate volume metrics
+        volume_ma = data['tick_volume'].rolling(window=self.params['bb_period']).mean()
+        volume_ratio = data['tick_volume'] / volume_ma
+        
+        # Detect breakouts
+        breakouts = self._detect_breakouts(
+            data=data,
+            upper_band=upper_band,
+            lower_band=lower_band,
+            volume_ratio=volume_ratio,
+            squeeze=squeeze
+        )
+        
+        # Calculate ATR for stop loss
+        atr = self._calculate_atr(data)
+        
+        return {
+            'valid': True,
+            'upper_band': upper_band,
+            'lower_band': lower_band,
+            'middle_band': middle_band,
+            'band_width': band_width,
+            'volatility': volatility,
+            'squeeze': squeeze,
+            'breakouts': breakouts,
+            'volume_ratio': volume_ratio,
+            'atr': atr,
+            'last_close': data['close'].iloc[-1]
+        }
+        
+    def _detect_squeeze(self, band_width: pd.Series, volatility: pd.Series) -> Dict[str, Any]:
+        """Detect volatility squeeze conditions"""
+        recent_width = band_width.iloc[-self.params['consolidation_periods']:]
+        recent_vol = volatility.iloc[-self.params['consolidation_periods']:]
+        
+        is_squeezed = (
+            (recent_width < recent_width.mean() * self.params['volatility_threshold']).all() and
+            (recent_vol < recent_vol.mean() * self.params['volatility_threshold']).all()
+        )
+        
+        return {
+            'active': is_squeezed,
+            'duration': self.params['consolidation_periods'] if is_squeezed else 0,
+            'intensity': (1 - recent_width.mean() / band_width.mean()) if is_squeezed else 0
+        }
+        
+    def _detect_breakouts(self, data: pd.DataFrame, upper_band: pd.Series,
+                         lower_band: pd.Series, volume_ratio: pd.Series,
+                         squeeze: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Detect valid breakout signals"""
+        breakouts = []
+        close = data['close']
+        
+        # Check for upper band breakout
+        if (close.iloc[-1] > upper_band.iloc[-1] and
+            close.iloc[-2] <= upper_band.iloc[-2]):
+            
+            # Confirm with volume and price movement
+            if (volume_ratio.iloc[-1] > self.params['volume_trigger'] and
+                (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] > 
+                self.params['breakout_threshold']):
+                
+                breakouts.append({
+                    'direction': 'up',
+                    'price': close.iloc[-1],
+                    'strength': volume_ratio.iloc[-1],
+                    'squeeze_active': squeeze['active']
+                })
+                
+        # Check for lower band breakout
+        elif (close.iloc[-1] < lower_band.iloc[-1] and
+              close.iloc[-2] >= lower_band.iloc[-2]):
+              
+            # Confirm with volume and price movement
+            if (volume_ratio.iloc[-1] > self.params['volume_trigger'] and
+                (close.iloc[-2] - close.iloc[-1]) / close.iloc[-2] >
+                self.params['breakout_threshold']):
+                
+                breakouts.append({
+                    'direction': 'down',
+                    'price': close.iloc[-1],
+                    'strength': volume_ratio.iloc[-1],
+                    'squeeze_active': squeeze['active']
+                })
+                
+        return breakouts
+        
+    def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range"""
+        high = data['high']
+        low = data['low']
+        close = data['close']
+        
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean()
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on volatility breakouts"""
+        if not analysis['valid'] or not analysis['breakouts']:
+            return []
+            
+        signals = []
+        current_price = analysis['last_close']
+        
+        # Calculate base position size and risk parameters
+        base_size = CONFIG['max_position_size']
+        atr = analysis['atr'].iloc[-1]
+        stop_distance = atr * self.params['stop_atr_multiple']
+        
+        # Process each breakout
+        for breakout in analysis['breakouts']:
+            # Adjust position size based on squeeze and volume strength
+            position_size = base_size
+            if breakout['squeeze_active']:
+                position_size *= 1.2  # Increase size for squeeze breakouts
+            position_size *= min(1.0, breakout['strength'])  # Scale by volume strength
+            
+            if not self.position:  # No current position
+                if breakout['direction'] == 'up':
+                    signals.append({
+                        'direction': 'buy',
+                        'size': position_size,
+                        'price': current_price,
+                        'stop_loss': current_price - stop_distance,
+                        'take_profits': [
+                            current_price + (stop_distance * level)
+                            for level in [1.5, 2.0, 3.0]
+                        ],
+                        'reason': 'volatility_breakout_long'
+                    })
+                else:  # down breakout
+                    signals.append({
+                        'direction': 'sell',
+                        'size': position_size,
+                        'price': current_price,
+                        'stop_loss': current_price + stop_distance,
+                        'take_profits': [
+                            current_price - (stop_distance * level)
+                            for level in [1.5, 2.0, 3.0]
+                        ],
+                        'reason': 'volatility_breakout_short'
+                    })
+                    
+            else:  # Managing existing position
+                if ((self.position['direction'] == 'buy' and breakout['direction'] == 'down') or
+                    (self.position['direction'] == 'sell' and breakout['direction'] == 'up')):
+                    
+                    signals.append({
+                        'direction': f"close_{self.position['direction']}",
+                        'size': self.position['size'],
+                        'price': current_price,
+                        'reason': 'volatility_reversal'
+                    })
+                    self.position = None
+                    
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
