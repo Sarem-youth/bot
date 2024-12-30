@@ -6,13 +6,17 @@ import logging
 import json
 import sys
 import psutil
-from typing import Dict, Any, Optional, Tuple, ClassVar, List
+from typing import Dict, Any, Optional, Tuple, ClassVar, List, Type
 import requests
 from datetime import datetime, timedelta
 import asyncio
 import aiohttp
 import pytest
 from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum, auto
+from abc import ABC, abstractmethod
+from typing import Protocol
 
 # Configuration and Constants
 CONFIG = {
@@ -311,6 +315,195 @@ class NewsAPI:
             return True
         return datetime.now() - self.last_news_update > timedelta(minutes=15)
 
+@dataclass
+class MarketCondition:
+    volatility: float
+    trend_strength: float
+    liquidity: float
+    regime: str
+    timestamp: datetime
+
+class MarketRegime(Enum):
+    TRENDING = auto()
+    RANGING = auto()
+    VOLATILE = auto()
+    QUIET = auto()
+
+class MarketAnalyzer:
+    def __init__(self):
+        self.conditions_history: List[MarketCondition] = []
+        self.current_regime: MarketRegime = MarketRegime.QUIET
+        self.volatility_threshold = 0.15
+        
+    def analyze_market_condition(self, data: pd.DataFrame) -> MarketCondition:
+        """Analyze current market conditions"""
+        try:
+            volatility = self._calculate_volatility(data)
+            trend_strength = self._calculate_trend_strength(data)
+            liquidity = self._analyze_liquidity(data)
+            regime = self._determine_regime(volatility, trend_strength)
+            
+            condition = MarketCondition(
+                volatility=volatility,
+                trend_strength=trend_strength,
+                liquidity=liquidity,
+                regime=regime.name,
+                timestamp=datetime.now()
+            )
+            
+            self.conditions_history.append(condition)
+            return condition
+            
+        except Exception as e:
+            logging.error(f"Market analysis error: {str(e)}")
+            return None
+            
+    def _calculate_volatility(self, data: pd.DataFrame) -> float:
+        """Calculate current market volatility"""
+        return data['close'].pct_change().std()
+        
+    def _calculate_trend_strength(self, data: pd.DataFrame) -> float:
+        """Calculate trend strength using ADX"""
+        # Simplified ADX calculation
+        return data['close'].rolling(14).std() / data['close'].mean()
+        
+    def _analyze_liquidity(self, data: pd.DataFrame) -> float:
+        """Analyze market liquidity"""
+        return data['volume'].mean() if 'volume' in data else 1.0
+        
+    def _determine_regime(self, volatility: float, trend_strength: float) -> MarketRegime:
+        """Determine current market regime"""
+        if volatility > self.volatility_threshold:
+            return MarketRegime.VOLATILE
+        elif trend_strength > 0.3:
+            return MarketRegime.TRENDING
+        elif trend_strength < 0.1:
+            return MarketRegime.RANGING
+        return MarketRegime.QUIET
+
+class ScalabilityManager:
+    def __init__(self):
+        self.resource_usage = {
+            'cpu': 0.0,
+            'memory': 0.0,
+            'network': 0.0
+        }
+        self.performance_metrics = {
+            'processing_time': [],
+            'api_latency': [],
+            'queue_size': 0
+        }
+        
+    async def monitor_resources(self):
+        """Monitor system resource usage"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            
+            self.resource_usage.update({
+                'cpu': cpu_percent,
+                'memory': memory.percent,
+                'network': len(asyncio.all_tasks())
+            })
+            
+            if cpu_percent > 80 or memory.percent > 80:
+                logging.warning("High resource usage detected")
+                await self.optimize_resources()
+                
+        except Exception as e:
+            logging.error(f"Resource monitoring error: {str(e)}")
+            
+    async def optimize_resources(self):
+        """Optimize resource usage based on current conditions"""
+        try:
+            # Implement resource optimization logic
+            if self.resource_usage['cpu'] > 80:
+                await self.reduce_processing_load()
+            if self.resource_usage['memory'] > 80:
+                await self.clear_caches()
+                
+        except Exception as e:
+            logging.error(f"Resource optimization error: {str(e)}")
+            
+    async def reduce_processing_load(self):
+        """Reduce processing load during high usage"""
+        # Implementation would include load reduction logic
+        pass
+        
+    async def clear_caches(self):
+        """Clear unnecessary caches"""
+        # Implementation would include cache clearing logic
+        pass
+
+class Strategy(Protocol):
+    """Protocol for trading strategy implementations"""
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]: ...
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]: ...
+    def get_parameters(self) -> Dict[str, Any]: ...
+    def set_parameters(self, params: Dict[str, Any]) -> None: ...
+
+class DataSource(Protocol):
+    """Protocol for data source implementations"""
+    def get_data(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame: ...
+    def is_available(self) -> bool: ...
+
+class BacktestEngine(ABC):
+    """Abstract base class for backtesting engines"""
+    @abstractmethod
+    def run_backtest(self, strategy: Strategy, data: pd.DataFrame) -> Dict[str, Any]:
+        """Run backtest with given strategy and data"""
+        pass
+    
+    @abstractmethod
+    def analyze_results(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze backtest results"""
+        pass
+
+class PluginManager:
+    """Manage bot plugins and extensions"""
+    def __init__(self):
+        self.strategies: Dict[str, Type[Strategy]] = {}
+        self.data_sources: Dict[str, Type[DataSource]] = {}
+        self.backtest_engines: Dict[str, Type[BacktestEngine]] = {}
+        
+    def register_strategy(self, name: str, strategy_class: Type[Strategy]):
+        """Register a new trading strategy"""
+        self.strategies[name] = strategy_class
+        logging.info(f"Registered strategy: {name}")
+        
+    def register_data_source(self, name: str, source_class: Type[DataSource]):
+        """Register a new data source"""
+        self.data_sources[name] = source_class
+        logging.info(f"Registered data source: {name}")
+        
+    def register_backtest_engine(self, name: str, engine_class: Type[BacktestEngine]):
+        """Register a new backtest engine"""
+        self.backtest_engines[name] = engine_class
+        logging.info(f"Registered backtest engine: {name}")
+
+class CustomizationManager:
+    """Manage user customizations and configurations"""
+    def __init__(self):
+        self.custom_indicators: Dict[str, Any] = {}
+        self.custom_rules: Dict[str, Any] = {}
+        self.templates: Dict[str, Dict[str, Any]] = {}
+        
+    def register_indicator(self, name: str, calculation_func: callable):
+        """Register custom technical indicator"""
+        self.custom_indicators[name] = calculation_func
+        
+    def register_rule(self, name: str, evaluation_func: callable):
+        """Register custom trading rule"""
+        self.custom_rules[name] = evaluation_func
+        
+    def save_template(self, name: str, config: Dict[str, Any]):
+        """Save strategy template"""
+        self.templates[name] = config.copy()
+        
+    def load_template(self, name: str) -> Optional[Dict[str, Any]]:
+        """Load strategy template"""
+        return self.templates.get(name)
+
 class GoldTradingBot:
     def __init__(self):
         self.compliance = ComplianceCheck()
@@ -321,7 +514,18 @@ class GoldTradingBot:
         self.test_support = TestSupport.get_instance()
         self.market_data_api = MarketDataAPI()
         self.news_api = NewsAPI()
+        self.market_analyzer = MarketAnalyzer()
+        self.scalability_manager = ScalabilityManager()
+        self.plugin_manager = PluginManager()
+        self.customization_manager = CustomizationManager()
+        self.active_strategies: Dict[str, Strategy] = {}
         logging.basicConfig(level=logging.INFO)
+        
+        # Register AMA strategy
+        self.plugin_manager.register_strategy(
+            'adaptive_ma',
+            AMAStrategy
+        )
         
     async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
@@ -364,6 +568,8 @@ class GoldTradingBot:
             logging.error("KYC verification failed")
             return False
             
+        # Initialize plugins
+        await self._initialize_plugins()
         self.initialized = True
         return True
     
@@ -387,6 +593,16 @@ class GoldTradingBot:
         except Exception as e:
             logging.error(f"Failed to initialize ML components: {str(e)}")
             return False
+    
+    async def _initialize_plugins(self):
+        """Initialize registered plugins"""
+        for name, strategy_class in self.plugin_manager.strategies.items():
+            try:
+                strategy = strategy_class()
+                self.active_strategies[name] = strategy
+                logging.info(f"Initialized strategy: {name}")
+            except Exception as e:
+                logging.error(f"Failed to initialize strategy {name}: {str(e)}")
     
     def get_gold_data(self) -> Optional[pd.DataFrame]:
         """Fetch current gold price data"""
@@ -439,21 +655,104 @@ class GoldTradingBot:
         return False
     
     async def run_trading_cycle(self):
-        """Execute trading cycle with real-time data"""
+        """Execute trading cycle with market adaptation"""
         try:
+            # Monitor system resources
+            await self.scalability_manager.monitor_resources()
+            
             # Get market data
+            data = self.get_gold_data()
+            if data is None:
+                return
+                
+            # Analyze market conditions
+            market_condition = self.market_analyzer.analyze_market_condition(data)
+            if market_condition:
+                # Adapt trading parameters based on market condition
+                self._adapt_trading_parameters(market_condition)
+                
+            # Run active strategies
+            for name, strategy in self.active_strategies.items():
+                try:
+                    analysis = strategy.analyze(data)
+                    signals = strategy.generate_signals(analysis)
+                    
+                    for signal in signals:
+                        if self._validate_signal(signal):
+                            await self._execute_signal(signal)
+                            
+                except Exception as e:
+                    logging.error(f"Strategy {name} error: {str(e)}")
+            
+            # Execute trading logic
             price = await self.market_data_api.get_gold_price()
             news = await self.news_api.get_gold_news()
             
-            # Process data and make trading decisions
-            if price and self.check_risk_limits(1.0):  # Example position size
-                logging.info(f"Current gold price: {price}")
-                logging.info(f"Recent news items: {len(news)}")
+            if price and self.check_risk_limits(1.0):
+                position_size = self._calculate_adaptive_position_size(market_condition)
+                logging.info(f"Adapted position size: {position_size}")
                 # Implement trading logic here
                 
         except Exception as e:
             logging.error(f"Trading cycle error: {str(e)}")
-    
+            
+    def _adapt_trading_parameters(self, condition: MarketCondition):
+        """Adapt trading parameters based on market conditions"""
+        if condition.regime == MarketRegime.VOLATILE.name:
+            self.user_preferences.preferences["risk_management"]["max_position_size"] *= 0.5
+        elif condition.regime == MarketRegime.QUIET.name:
+            self.user_preferences.preferences["risk_management"]["max_position_size"] *= 1.2
+            
+    def _calculate_adaptive_position_size(self, condition: MarketCondition) -> float:
+        """Calculate position size based on market conditions"""
+        base_size = self.user_preferences.preferences["risk_management"]["max_position_size"]
+        volatility_factor = 1.0 / (1.0 + condition.volatility)
+        liquidity_factor = min(1.0, condition.liquidity)
+        
+        return base_size * volatility_factor * liquidity_factor
+
+    def _validate_signal(self, signal: Dict[str, Any]) -> bool:
+        """Validate trading signal"""
+        try:
+            required_fields = ['direction', 'size', 'price']
+            if not all(field in signal for field in required_fields):
+                return False
+                
+            if not self.check_risk_limits(signal['size']):
+                return False
+                
+            return True
+        except Exception as e:
+            logging.error(f"Signal validation error: {str(e)}")
+            return False
+            
+    async def _execute_signal(self, signal: Dict[str, Any]):
+        """Execute validated trading signal"""
+        try:
+            # Implement signal execution logic
+            logging.info(f"Executing signal: {signal}")
+            # Add actual trade execution code here
+        except Exception as e:
+            logging.error(f"Signal execution error: {str(e)}")
+            
+    def run_backtest(self, strategy_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
+        """Run backtest for specified strategy"""
+        try:
+            strategy = self.active_strategies.get(strategy_name)
+            if not strategy:
+                raise ValueError(f"Strategy {strategy_name} not found")
+                
+            engine = list(self.plugin_manager.backtest_engines.values())[0]()
+            data = self._get_historical_data(start_date, end_date)
+            
+            results = engine.run_backtest(strategy, data)
+            analysis = engine.analyze_results(results)
+            
+            return analysis
+        except Exception as e:
+            logging.error(f"Backtest error: {str(e)}")
+            return {}
+
     def shutdown(self):
         """Clean shutdown of bot"""
         if self.initialized:
@@ -497,3 +796,117 @@ if __name__ == "__main__":
         logging.error(f"Error during bot operation: {str(e)}")
     finally:
         bot.shutdown()
+
+class AMAStrategy(Strategy):
+    """Adaptive Moving Average strategy for gold trading"""
+    def __init__(self):
+        self.params = {
+            'er_period': 10,        # Efficiency Ratio period
+            'fast_period': 2,       # Fast EMA period
+            'slow_period': 30,      # Slow EMA period
+            'volatility_window': 20 # Window for volatility calculation
+        }
+        self.position = None
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze price data using AMA"""
+        if len(data) < self.params['slow_period']:
+            return {'valid': False}
+            
+        # Calculate price change and direction
+        price_change = np.abs(data['close'].diff())
+        direction = data['close'].diff()
+        
+        # Calculate Efficiency Ratio (ER)
+        volatility = price_change.rolling(self.params['er_period']).sum()
+        direction_movement = np.abs(data['close'].diff(self.params['er_period']))
+        er = direction_movement / volatility
+        er = er.fillna(0.0)
+        
+        # Calculate adaptive factor
+        fast_sc = 2.0 / (self.params['fast_period'] + 1)
+        slow_sc = 2.0 / (self.params['slow_period'] + 1)
+        adaptive_factor = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+        
+        # Calculate AMA
+        ama = pd.Series(index=data.index, dtype=float)
+        ama.iloc[0] = data['close'].iloc[0]
+        
+        for i in range(1, len(data)):
+            ama.iloc[i] = ama.iloc[i-1] + adaptive_factor.iloc[i] * (
+                data['close'].iloc[i] - ama.iloc[i-1]
+            )
+        
+        # Calculate volatility
+        volatility = data['close'].rolling(
+            window=self.params['volatility_window']
+        ).std()
+        
+        return {
+            'valid': True,
+            'ama': ama,
+            'er': er,
+            'volatility': volatility,
+            'adaptive_factor': adaptive_factor,
+            'last_close': data['close'].iloc[-1],
+            'last_ama': ama.iloc[-1]
+        }
+    
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on AMA analysis"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        last_close = analysis['last_close']
+        last_ama = analysis['last_ama']
+        last_volatility = analysis['volatility'].iloc[-1]
+        
+        # Dynamic position sizing based on volatility
+        base_size = CONFIG['max_position_size']
+        volatility_factor = 1.0 / (1.0 + last_volatility)
+        position_size = base_size * volatility_factor
+        
+        # Generate signals based on price crossing AMA
+        if self.position is None:  # No current position
+            if last_close > last_ama:
+                signals.append({
+                    'direction': 'buy',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'price_above_ama'
+                })
+            elif last_close < last_ama:
+                signals.append({
+                    'direction': 'sell',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'price_below_ama'
+                })
+        else:  # Managing existing position
+            if self.position['direction'] == 'buy' and last_close < last_ama:
+                signals.append({
+                    'direction': 'close_buy',
+                    'size': self.position['size'],
+                    'price': last_close,
+                    'reason': 'price_below_ama'
+                })
+                self.position = None
+            elif self.position['direction'] == 'sell' and last_close > last_ama:
+                signals.append({
+                    'direction': 'close_sell',
+                    'size': self.position['size'],
+                    'price': last_close,
+                    'reason': 'price_above_ama'
+                })
+                self.position = None
+        
+        return signals
+    
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+    
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
