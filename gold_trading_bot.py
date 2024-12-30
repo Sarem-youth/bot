@@ -539,6 +539,12 @@ class GoldTradingBot:
             BollingerADXStrategy
         )
         
+        # Register Range Trading strategy
+        self.plugin_manager.register_strategy(
+            'range_trading',
+            RangeStrategy
+        )
+        
     async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
         if self.test_support.is_test_mode:
@@ -1187,6 +1193,177 @@ class BollingerADXStrategy(Strategy):
                         'size': self.position['size'],
                         'price': last_close,
                         'reason': 'bb_adx_take_profit'
+                    })
+                    self.position = None
+        
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class RangeStrategy(Strategy):
+    """RSI Divergence and Stochastic Oscillator range trading strategy"""
+    def __init__(self):
+        self.params = {
+            'rsi_period': 14,           # RSI calculation period
+            'rsi_overbought': 70,       # RSI overbought threshold
+            'rsi_oversold': 30,         # RSI oversold threshold
+            'stoch_k_period': 14,       # Stochastic K period
+            'stoch_d_period': 3,        # Stochastic D period
+            'stoch_overbought': 80,     # Stochastic overbought threshold
+            'stoch_oversold': 20,       # Stochastic oversold threshold
+            'divergence_length': 5,     # Bars to check for divergence
+            'confirmation_bars': 2      # Bars needed for confirmation
+        }
+        self.position = None
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze price data using RSI and Stochastic"""
+        if len(data) < max(self.params['rsi_period'], 
+                          self.params['stoch_k_period'] + self.params['stoch_d_period']):
+            return {'valid': False}
+            
+        # Calculate RSI
+        delta = data['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=self.params['rsi_period']).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=self.params['rsi_period']).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        # Calculate Stochastic Oscillator
+        low_min = data['low'].rolling(window=self.params['stoch_k_period']).min()
+        high_max = data['high'].rolling(window=self.params['stoch_k_period']).max()
+        
+        stoch_k = 100 * (data['close'] - low_min) / (high_max - low_min)
+        stoch_d = stoch_k.rolling(window=self.params['stoch_d_period']).mean()
+        
+        # Detect RSI divergence
+        bullish_div = self._detect_bullish_divergence(data['close'], rsi)
+        bearish_div = self._detect_bearish_divergence(data['close'], rsi)
+        
+        # Calculate range statistics
+        volatility = data['close'].pct_change().std()
+        avg_range = (data['high'] - data['low']).rolling(window=20).mean()
+        
+        return {
+            'valid': True,
+            'rsi': rsi,
+            'stoch_k': stoch_k,
+            'stoch_d': stoch_d,
+            'bullish_div': bullish_div,
+            'bearish_div': bearish_div,
+            'volatility': volatility,
+            'avg_range': avg_range,
+            'last_close': data['close'].iloc[-1],
+            'last_rsi': rsi.iloc[-1],
+            'last_stoch_k': stoch_k.iloc[-1],
+            'last_stoch_d': stoch_d.iloc[-1]
+        }
+        
+    def _detect_bullish_divergence(self, price: pd.Series, rsi: pd.Series) -> bool:
+        """Detect bullish RSI divergence"""
+        lookback = self.params['divergence_length']
+        if len(price) < lookback or len(rsi) < lookback:
+            return False
+            
+        # Check for lower lows in price but higher lows in RSI
+        price_min = price.iloc[-lookback:].min()
+        rsi_min = rsi.iloc[-lookback:].min()
+        
+        if (price.iloc[-1] < price_min and 
+            rsi.iloc[-1] > rsi_min and 
+            rsi.iloc[-1] < self.params['rsi_oversold']):
+            return True
+        return False
+        
+    def _detect_bearish_divergence(self, price: pd.Series, rsi: pd.Series) -> bool:
+        """Detect bearish RSI divergence"""
+        lookback = self.params['divergence_length']
+        if len(price) < lookback or len(rsi) < lookback:
+            return False
+            
+        # Check for higher highs in price but lower highs in RSI
+        price_max = price.iloc[-lookback:].max()
+        rsi_max = rsi.iloc[-lookback:].max()
+        
+        if (price.iloc[-1] > price_max and 
+            rsi.iloc[-1] < rsi_max and 
+            rsi.iloc[-1] > self.params['rsi_overbought']):
+            return True
+        return False
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on RSI divergence and Stochastic confirmation"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        last_close = analysis['last_close']
+        last_rsi = analysis['last_rsi']
+        last_stoch_k = analysis['last_stoch_k']
+        last_stoch_d = analysis['last_stoch_d']
+        
+        # Calculate position size based on volatility and average range
+        base_size = CONFIG['max_position_size']
+        vol_factor = 1.0 / (1.0 + analysis['volatility'])
+        range_factor = min(1.0, analysis['avg_range'].iloc[-1] / last_close * 100)
+        position_size = base_size * vol_factor * range_factor
+        
+        # Generate signals for range trading
+        if self.position is None:  # No current position
+            # Bullish signals
+            if (analysis['bullish_div'] and  # RSI bullish divergence
+                last_stoch_k < self.params['stoch_oversold'] and  # Stochastic oversold
+                last_stoch_k > last_stoch_d):  # Stochastic bullish cross
+                signals.append({
+                    'direction': 'buy',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'range_bullish',
+                    'rsi': last_rsi,
+                    'stoch_k': last_stoch_k
+                })
+                
+            # Bearish signals
+            elif (analysis['bearish_div'] and  # RSI bearish divergence
+                  last_stoch_k > self.params['stoch_overbought'] and  # Stochastic overbought
+                  last_stoch_k < last_stoch_d):  # Stochastic bearish cross
+                signals.append({
+                    'direction': 'sell',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'range_bearish',
+                    'rsi': last_rsi,
+                    'stoch_k': last_stoch_k
+                })
+                
+        else:  # Managing existing position
+            if self.position['direction'] == 'buy':
+                if (last_stoch_k > self.params['stoch_overbought'] or  # Stochastic overbought
+                    (last_rsi > self.params['rsi_overbought'] and  # RSI overbought
+                     last_stoch_k < last_stoch_d)):  # Stochastic bearish cross
+                    signals.append({
+                        'direction': 'close_buy',
+                        'size': self.position['size'],
+                        'price': last_close,
+                        'reason': 'range_take_profit'
+                    })
+                    self.position = None
+                    
+            elif self.position['direction'] == 'sell':
+                if (last_stoch_k < self.params['stoch_oversold'] or  # Stochastic oversold
+                    (last_rsi < self.params['rsi_oversold'] and  # RSI oversold
+                     last_stoch_k > last_stoch_d)):  # Stochastic bullish cross
+                    signals.append({
+                        'direction': 'close_sell',
+                        'size': self.position['size'],
+                        'price': last_close,
+                        'reason': 'range_take_profit'
                     })
                     self.position = None
         
