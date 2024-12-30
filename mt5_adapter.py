@@ -257,6 +257,44 @@ class MT5Adapter:
         self.pull_socket.close()
         self.context.term()
 
+    def get_current_tick(self, symbol: str) -> Optional[Dict]:
+        """Get current market tick data"""
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick:
+                return {
+                    'bid': tick.bid,
+                    'ask': tick.ask,
+                    'volume': tick.volume,
+                    'time': tick.time,
+                    'last': tick.last,
+                    'flags': tick.flags
+                }
+        except Exception as e:
+            self.environment.logger.error(f"Error getting tick data: {e}")
+            self.environment.daily_stats['errors'] += 1
+        return None
+
+    def get_open_positions(self) -> List[Dict]:
+        """Get currently open positions"""
+        try:
+            positions = mt5.positions_get()
+            if positions:
+                return [{
+                    'ticket': pos.ticket,
+                    'symbol': pos.symbol,
+                    'type': 'BUY' if pos.type == mt5.POSITION_TYPE_BUY else 'SELL',
+                    'volume': pos.volume,
+                    'open_price': pos.price_open,
+                    'sl': pos.sl,
+                    'tp': pos.tp,
+                    'profit': pos.profit
+                } for pos in positions]
+        except Exception as e:
+            self.environment.logger.error(f"Error getting positions: {e}")
+            self.environment.daily_stats['errors'] += 1
+        return []
+
 class MT5TesterAdapter:
     def __init__(self, config: MT5Config):
         self.config = config
