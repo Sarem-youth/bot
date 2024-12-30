@@ -557,6 +557,15 @@ class GoldTradingBot:
             EventDrivenStrategy
         )
         
+        # Register Economic Events strategy
+        self.plugin_manager.register_strategy(
+            'economic_events',
+            EconomicEventsStrategy
+        )
+        
+        # Add ATR Risk Manager
+        self.risk_manager = ATRRiskManager()
+        
     async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
         if self.test_support.is_test_mode:
@@ -742,26 +751,94 @@ class GoldTradingBot:
         return base_size * volatility_factor * liquidity_factor
 
     def _validate_signal(self, signal: Dict[str, Any]) -> bool:
-        """Validate trading signal"""
+        """Validate trading signal with ATR-based risk management"""
         try:
             required_fields = ['direction', 'size', 'price']
             if not all(field in signal for field in required_fields):
                 return False
                 
+            # Get current account balance
+            account_balance = mt5.account_info().balance
+            current_exposure = self._get_current_exposure()
+            
+            # Get latest market data
+            data = self.get_gold_data()
+            if data is None:
+                return False
+                
+            # Calculate position parameters
+            position_params = self.risk_manager.calculate_position_params(
+                data=data,
+                account_balance=account_balance,
+                current_exposure=current_exposure
+            )
+            
+            if position_params is None:
+                return False
+                
+            # Adjust signal with ATR-based parameters
+            signal['size'] = min(signal['size'], position_params['position_size'])
+            signal['stop_loss'] = position_params['stop_loss']
+            signal['take_profits'] = position_params['take_profits']
+            signal['atr'] = position_params['atr']
+            
+            # Check risk limits
             if not self.check_risk_limits(signal['size']):
                 return False
                 
             return True
+            
         except Exception as e:
             logging.error(f"Signal validation error: {str(e)}")
             return False
-            
-    async def _execute_signal(self, signal: Dict[str, Any]):
-        """Execute validated trading signal"""
+    
+    def _get_current_exposure(self) -> float:
+        """Calculate current market exposure"""
         try:
-            # Implement signal execution logic
-            logging.info(f"Executing signal: {signal}")
-            # Add actual trade execution code here
+            positions = mt5.positions_get(symbol=CONFIG['symbol'])
+            if positions is None:
+                return 0.0
+                
+            total_exposure = sum(pos.volume for pos in positions)
+            return total_exposure
+            
+        except Exception as e:
+            logging.error(f"Error calculating exposure: {str(e)}")
+            return 0.0
+    
+    async def _execute_signal(self, signal: Dict[str, Any]):
+        """Execute signal with ATR-based stops and targets"""
+        try:
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": CONFIG['symbol'],
+                "volume": signal['size'],
+                "type": mt5.ORDER_TYPE_BUY if signal['direction'] == 'buy' else mt5.ORDER_TYPE_SELL,
+                "price": signal['price'],
+                "sl": signal['stop_loss'],
+                "tp": signal['take_profits'][0],  # Use first target
+                "comment": f"ATR:{signal['atr']:.2f}"
+            }
+            
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                logging.error(f"Order failed: {result.comment}")
+                return
+                
+            # Place additional take-profit orders if successful
+            if len(signal['take_profits']) > 1:
+                for tp_price in signal['take_profits'][1:]:
+                    tp_request = {
+                        "action": mt5.TRADE_ACTION_PENDING,
+                        "symbol": CONFIG['symbol'],
+                        "volume": signal['size'] * 0.5,  # Scale out
+                        "type": mt5.ORDER_TYPE_SELL_LIMIT if signal['direction'] == 'buy' 
+                               else mt5.ORDER_TYPE_BUY_LIMIT,
+                        "price": tp_price,
+                        "comment": f"TP_ATR:{signal['atr']:.2f}"
+                    }
+                    mt5.order_send(tp_request)
+                    
         except Exception as e:
             logging.error(f"Signal execution error: {str(e)}")
             
@@ -1839,3 +1916,366 @@ class EventDrivenStrategy(Strategy):
     def set_parameters(self, params: Dict[str, Any]) -> None:
         """Update strategy parameters"""
         self.params.update(params)
+
+class EconomicEventsStrategy(Strategy):
+    """Strategy for trading gold based on economic and geopolitical events"""
+    def __init__(self):
+        self.params = {
+            'event_impact_window': 120,    # Minutes to monitor event impact
+            'correlation_window': 30,      # Days for correlation analysis
+            'min_correlation': 0.6,        # Minimum correlation threshold
+            'risk_adjust_factor': 0.8,     # Position size adjustment for high-risk events
+            'event_categories': {          # Event categories and their weights
+                'monetary_policy': {
+                    'weight': 1.0,
+                    'keywords': ['fed', 'rate decision', 'central bank', 'monetary policy'],
+                    'risk_level': 'high'
+                },
+                'inflation': {
+                    'weight': 0.9,
+                    'keywords': ['cpi', 'inflation', 'price index', 'deflation'],
+                    'risk_level': 'high'
+                },
+                'geopolitical': {
+                    'weight': 0.8,
+                    'keywords': ['conflict', 'sanctions', 'war', 'treaty'],
+                    'risk_level': 'high'
+                },
+                'economic_data': {
+                    'weight': 0.7,
+                    'keywords': ['gdp', 'employment', 'retail sales', 'trade balance'],
+                    'risk_level': 'medium'
+                },
+                'market_sentiment': {
+                    'weight': 0.6,
+                    'keywords': ['risk appetite', 'safe haven', 'market fear'],
+                    'risk_level': 'medium'
+                }
+            }
+        }
+        self.position = None
+        self.active_events = []
+        self.correlations = {}
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze economic events and their impact on gold"""
+        if len(data) < 20:
+            return {'valid': False}
+            
+        # Get economic calendar events
+        events = self._fetch_economic_events()
+        
+        # Analyze event importance and potential impact
+        event_analysis = self._analyze_events(events)
+        
+        # Calculate market correlations
+        correlations = self._calculate_correlations(data)
+        
+        # Assess event impact on price
+        impact_analysis = self._assess_event_impact(
+            events=event_analysis,
+            correlations=correlations,
+            current_price=data['close'].iloc[-1],
+            volatility=data['close'].pct_change().std()
+        )
+        
+        return {
+            'valid': True,
+            'events': event_analysis,
+            'correlations': correlations,
+            'impact': impact_analysis,
+            'last_close': data['close'].iloc[-1],
+            'volatility': data['close'].pct_change().std() * np.sqrt(252)
+        }
+        
+    def _fetch_economic_events(self) -> List[Dict[str, Any]]:
+        """Fetch relevant economic and geopolitical events"""
+        try:
+            # Use existing NewsAPI to get events
+            news_api = NewsAPI()
+            news = asyncio.get_event_loop().run_until_complete(news_api.get_gold_news())
+            
+            # Filter and categorize events
+            events = []
+            for article in news:
+                event_type = self._categorize_event(article['title'])
+                if event_type:
+                    events.append({
+                        'id': article['id'],
+                        'title': article['title'],
+                        'type': event_type,
+                        'timestamp': article['published_at'],
+                        'category': self.params['event_categories'][event_type]
+                    })
+            
+            return events
+        except Exception as e:
+            logging.error(f"Error fetching economic events: {str(e)}")
+            return []
+            
+    def _categorize_event(self, text: str) -> Optional[str]:
+        """Categorize event based on keywords"""
+        text = text.lower()
+        for category, info in self.params['event_categories'].items():
+            if any(keyword in text for keyword in info['keywords']):
+                return category
+        return None
+        
+    def _analyze_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Analyze events for trading significance"""
+        analyzed_events = []
+        for event in events:
+            # Calculate event importance score
+            category = self.params['event_categories'][event['type']]
+            importance_score = category['weight']
+            
+            # Adjust for risk level
+            if category['risk_level'] == 'high':
+                importance_score *= self.params['risk_adjust_factor']
+                
+            analyzed_events.append({
+                **event,
+                'importance': importance_score,
+                'risk_level': category['risk_level']
+            })
+            
+        return analyzed_events
+        
+    def _calculate_correlations(self, data: pd.DataFrame) -> Dict[str, float]:
+        """Calculate correlations with related markets"""
+        try:
+            # Example markets that affect gold
+            correlations = {
+                'usd_index': -0.7,  # Placeholder for actual correlation
+                'treasury_yields': -0.5,
+                'equity_markets': -0.3,
+                'commodity_index': 0.4
+            }
+            
+            # In real implementation, fetch data and calculate actual correlations
+            return correlations
+        except Exception as e:
+            logging.error(f"Error calculating correlations: {str(e)}")
+            return {}
+            
+    def _assess_event_impact(self, events: List[Dict[str, Any]], 
+                           correlations: Dict[str, float],
+                           current_price: float,
+                           volatility: float) -> Dict[str, Any]:
+        """Assess potential impact of events on gold price"""
+        # Calculate aggregate impact score
+        impact_score = sum(
+            event['importance'] for event in events
+        ) / max(len(events), 1)
+        
+        # Adjust for market conditions
+        correlation_factor = abs(sum(correlations.values()) / len(correlations))
+        volatility_factor = 1.0 / (1.0 + volatility)
+        
+        # Determine likely price direction
+        bullish_events = sum(1 for e in events if e['type'] in ['geopolitical', 'market_sentiment'])
+        bearish_events = sum(1 for e in events if e['type'] in ['monetary_policy'])
+        
+        direction = 'bullish' if bullish_events > bearish_events else 'bearish'
+        
+        return {
+            'score': impact_score * correlation_factor * volatility_factor,
+            'direction': direction,
+            'confidence': correlation_factor,
+            'risk_level': 'high' if impact_score > 0.7 else 'medium'
+        }
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on economic events"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        impact = analysis['impact']
+        current_price = analysis['last_close']
+        
+        # Calculate position size based on impact and risk
+        base_size = CONFIG['max_position_size']
+        risk_factor = 0.7 if impact['risk_level'] == 'high' else 1.0
+        position_size = base_size * impact['score'] * risk_factor
+        
+        # Generate entry signals
+        if not self.position:
+            if impact['direction'] == 'bullish' and impact['score'] > 0.6:
+                signals.append({
+                    'direction': 'buy',
+                    'size': position_size,
+                    'price': current_price,
+                    'reason': 'economic_event_bullish',
+                    'impact_score': impact['score'],
+                    'confidence': impact['confidence']
+                })
+            elif impact['direction'] == 'bearish' and impact['score'] > 0.6:
+                signals.append({
+                    'direction': 'sell',
+                    'size': position_size,
+                    'price': current_price,
+                    'reason': 'economic_event_bearish',
+                    'impact_score': impact['score'],
+                    'confidence': impact['confidence']
+                })
+                
+        # Generate exit signals
+        else:
+            if ((self.position['direction'] == 'buy' and impact['direction'] == 'bearish') or
+                (self.position['direction'] == 'sell' and impact['direction'] == 'bullish')):
+                if impact['score'] > 0.5:  # Significant contrary event
+                    signals.append({
+                        'direction': f"close_{self.position['direction']}",
+                        'size': self.position['size'],
+                        'price': current_price,
+                        'reason': 'event_reversal',
+                        'impact_score': impact['score']
+                    })
+                    self.position = None
+                    
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class ATRRiskManager:
+    """ATR-based risk management for dynamic position sizing and stops"""
+    def __init__(self):
+        self.params = {
+            'atr_period': 14,          # Period for ATR calculation
+            'risk_per_trade': 0.02,    # 2% risk per trade
+            'atr_multiplier': 2.0,     # Multiplier for stop distance
+            'max_position_size': 1.0,  # Maximum allowed position size
+            'min_stop_distance': 10,   # Minimum stop distance in points
+            'pyramiding_levels': 3,    # Maximum number of scale-in entries
+            'scale_out_levels': [0.5, 0.3, 0.2]  # Position exit proportions
+        }
+        
+    def calculate_position_params(self, 
+                                data: pd.DataFrame, 
+                                account_balance: float,
+                                current_exposure: float = 0.0) -> Dict[str, float]:
+        """Calculate position size and stop levels using ATR"""
+        try:
+            # Calculate ATR
+            high_low = data['high'] - data['low']
+            high_close = abs(data['high'] - data['close'].shift())
+            low_close = abs(data['low'] - data['close'].shift())
+            
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = tr.rolling(window=self.params['atr_period']).mean()
+            
+            current_atr = atr.iloc[-1]
+            current_price = data['close'].iloc[-1]
+            
+            # Calculate stop distance
+            stop_distance = max(
+                current_atr * self.params['atr_multiplier'],
+                self.params['min_stop_distance']
+            )
+            
+            # Calculate position size based on risk
+            risk_amount = account_balance * self.params['risk_per_trade']
+            position_size = self._calculate_position_size(
+                risk_amount=risk_amount,
+                stop_distance=stop_distance,
+                current_price=current_price,
+                current_exposure=current_exposure
+            )
+            
+            # Calculate stop levels
+            stop_loss = self._calculate_stop_level(
+                current_price=current_price,
+                stop_distance=stop_distance,
+                position_type='long'
+            )
+            
+            # Calculate take-profit levels
+            take_profits = self._calculate_take_profits(
+                entry_price=current_price,
+                stop_distance=stop_distance,
+                position_type='long'
+            )
+            
+            return {
+                'position_size': position_size,
+                'stop_loss': stop_loss,
+                'take_profits': take_profits,
+                'atr': current_atr,
+                'risk_amount': risk_amount
+            }
+            
+        except Exception as e:
+            logging.error(f"Error calculating position parameters: {str(e)}")
+            return None
+            
+    def _calculate_position_size(self,
+                               risk_amount: float,
+                               stop_distance: float,
+                               current_price: float,
+                               current_exposure: float) -> float:
+        """Calculate safe position size based on risk parameters"""
+        # Convert stop distance to price risk
+        price_risk = stop_distance * current_price / 10000  # For gold points
+        
+        # Calculate base position size
+        position_size = risk_amount / price_risk
+        
+        # Apply position size limits
+        position_size = min(
+            position_size,
+            self.params['max_position_size'] - current_exposure
+        )
+        
+        return max(0.0, position_size)
+        
+    def _calculate_stop_level(self,
+                            current_price: float,
+                            stop_distance: float,
+                            position_type: str) -> float:
+        """Calculate stop-loss level based on ATR"""
+        if position_type == 'long':
+            return current_price - stop_distance
+        else:  # short position
+            return current_price + stop_distance
+            
+    def _calculate_take_profits(self,
+                              entry_price: float,
+                              stop_distance: float,
+                              position_type: str) -> List[float]:
+        """Calculate multiple take-profit levels"""
+        risk_reward_ratios = [1.5, 2.0, 3.0]  # Multiple R:R levels
+        
+        if position_type == 'long':
+            return [
+                entry_price + (stop_distance * ratio)
+                for ratio in risk_reward_ratios
+            ]
+        else:  # short position
+            return [
+                entry_price - (stop_distance * ratio)
+                for ratio in risk_reward_ratios
+            ]
+            
+    def adjust_stops_for_volatility(self,
+                                  current_stop: float,
+                                  current_atr: float,
+                                  price_data: pd.Series) -> float:
+        """Dynamically adjust stop-loss based on volatility"""
+        volatility_factor = current_atr / price_data.std()
+        new_stop = current_stop
+        
+        if volatility_factor > 1.5:  # High volatility
+            # Widen stop distance
+            if current_stop < price_data.iloc[-1]:  # Long position
+                new_stop -= current_atr * 0.5
+            else:  # Short position
+                new_stop += current_atr * 0.5
+        
+        return new_stop
