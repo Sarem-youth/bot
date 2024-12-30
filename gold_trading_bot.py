@@ -6,7 +6,11 @@ import logging
 import json
 import sys
 import psutil
-from typing import Dict, Any, Optional, Tuple, ClassVar
+from typing import Dict, Any, Optional, Tuple, ClassVar, List
+import requests
+from datetime import datetime, timedelta
+import asyncio
+import aiohttp
 import pytest
 from pathlib import Path
 
@@ -70,6 +74,33 @@ RESOURCE_REQUIREMENTS = {
         "tensorflow",
         "MetaTrader5"
     ]
+}
+
+# Add new API configuration after existing CONFIG blocks
+API_CONFIG = {
+    "market_data": {
+        "mt5": {
+            "timeout": 30,
+            "max_retries": 3
+        },
+        "alpha_vantage": {
+            "api_key": "YOUR_API_KEY",
+            "base_url": "https://www.alphavantage.co/query",
+            "timeout": 10
+        }
+    },
+    "news": {
+        "reuters": {
+            "api_key": "YOUR_API_KEY",
+            "base_url": "https://api.reuters.com/v2",
+            "timeout": 5
+        },
+        "trading_central": {
+            "api_key": "YOUR_API_KEY",
+            "base_url": "https://api.tradingcentral.com",
+            "timeout": 5
+        }
+    }
 }
 
 class ComplianceCheck:
@@ -197,6 +228,89 @@ class TestSupport:
     def set_mock_data(self, key: str, value: Any):
         self.mock_data[key] = value
 
+class MarketDataAPI:
+    def __init__(self):
+        self.cache = {}
+        self.last_update = {}
+        
+    async def get_gold_price(self, source: str = "mt5") -> Optional[float]:
+        """Fetch gold price from specified source"""
+        if source == "mt5":
+            return await self._get_mt5_gold_price()
+        elif source == "alpha_vantage":
+            return await self._get_alphavantage_gold_price()
+        return None
+        
+    async def _get_mt5_gold_price(self) -> Optional[float]:
+        """Get gold price from MT5"""
+        try:
+            symbol_info = mt5.symbol_info("XAUUSD")
+            if symbol_info is None:
+                return None
+            return symbol_info.bid
+        except Exception as e:
+            logging.error(f"MT5 gold price error: {str(e)}")
+            return None
+            
+    async def _get_alphavantage_gold_price(self) -> Optional[float]:
+        """Get gold price from Alpha Vantage"""
+        url = f"{API_CONFIG['market_data']['alpha_vantage']['base_url']}"
+        params = {
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": "XAU",
+            "to_currency": "USD",
+            "apikey": API_CONFIG["market_data"]["alpha_vantage"]["api_key"]
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    data = await response.json()
+                    return float(data["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
+        except Exception as e:
+            logging.error(f"Alpha Vantage API error: {str(e)}")
+            return None
+
+class NewsAPI:
+    def __init__(self):
+        self.news_cache = []
+        self.last_news_update = None
+        
+    async def get_gold_news(self) -> List[Dict[str, Any]]:
+        """Fetch gold-related news"""
+        if not self._should_update_news():
+            return self.news_cache
+            
+        reuters_news = await self._get_reuters_news()
+        if reuters_news:
+            self.news_cache = reuters_news
+            self.last_news_update = datetime.now()
+            
+        return self.news_cache
+        
+    async def _get_reuters_news(self) -> List[Dict[str, Any]]:
+        """Fetch news from Reuters API"""
+        url = f"{API_CONFIG['news']['reuters']['base_url']}/news/search"
+        headers = {"Authorization": f"Bearer {API_CONFIG['news']['reuters']['api_key']}"}
+        params = {
+            "keyword": "gold",
+            "limit": 10,
+            "sort": "newest"
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as response:
+                    data = await response.json()
+                    return data.get("results", [])
+        except Exception as e:
+            logging.error(f"Reuters API error: {str(e)}")
+            return []
+            
+    def _should_update_news(self) -> bool:
+        """Check if news cache should be updated"""
+        if not self.last_news_update:
+            return True
+        return datetime.now() - self.last_news_update > timedelta(minutes=15)
+
 class GoldTradingBot:
     def __init__(self):
         self.compliance = ComplianceCheck()
@@ -205,9 +319,11 @@ class GoldTradingBot:
         self.resource_check = ResourceCheck()
         self.ml_models = {}
         self.test_support = TestSupport.get_instance()
+        self.market_data_api = MarketDataAPI()
+        self.news_api = NewsAPI()
         logging.basicConfig(level=logging.INFO)
         
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
         if self.test_support.is_test_mode:
             logging.info("Initializing in test mode")
@@ -228,6 +344,16 @@ class GoldTradingBot:
         # Initialize ML frameworks
         if not self._initialize_ml_components():
             return False
+            
+        # Verify API connections
+        price = await self.market_data_api.get_gold_price()
+        if price is None:
+            logging.error("Failed to connect to market data APIs")
+            return False
+            
+        news = await self.news_api.get_gold_news()
+        if not news and not self.test_support.is_test_mode:
+            logging.warning("News API connection failed")
             
         # Continue with existing initialization
         if not mt5.initialize():
@@ -312,6 +438,22 @@ class GoldTradingBot:
         # Implementation would check actual market hours
         return False
     
+    async def run_trading_cycle(self):
+        """Execute trading cycle with real-time data"""
+        try:
+            # Get market data
+            price = await self.market_data_api.get_gold_price()
+            news = await self.news_api.get_gold_news()
+            
+            # Process data and make trading decisions
+            if price and self.check_risk_limits(1.0):  # Example position size
+                logging.info(f"Current gold price: {price}")
+                logging.info(f"Recent news items: {len(news)}")
+                # Implement trading logic here
+                
+        except Exception as e:
+            logging.error(f"Trading cycle error: {str(e)}")
+    
     def shutdown(self):
         """Clean shutdown of bot"""
         if self.initialized:
@@ -345,11 +487,12 @@ if __name__ == "__main__":
     setup_development_env()
     bot = GoldTradingBot()
     try:
-        if bot.initialize():
-            logging.info("Bot initialized successfully")
-            data = bot.get_gold_data()
-            if data is not None:
-                logging.info(f"Successfully fetched {len(data)} gold price records")
+        asyncio.run(bot.initialize())
+        while True:
+            asyncio.run(bot.run_trading_cycle())
+            await asyncio.sleep(1)  # 1-second delay between cycles
+    except KeyboardInterrupt:
+        logging.info("Bot shutdown requested")
     except Exception as e:
         logging.error(f"Error during bot operation: {str(e)}")
     finally:
