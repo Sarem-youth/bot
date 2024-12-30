@@ -527,6 +527,18 @@ class GoldTradingBot:
             AMAStrategy
         )
         
+        # Register EMA Cross strategy
+        self.plugin_manager.register_strategy(
+            'ema_cross',
+            EMACrossStrategy
+        )
+        
+        # Register Bollinger Bands + ADX strategy
+        self.plugin_manager.register_strategy(
+            'bollinger_adx',
+            BollingerADXStrategy
+        )
+        
     async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
         if self.test_support.is_test_mode:
@@ -907,6 +919,283 @@ class AMAStrategy(Strategy):
         """Get strategy parameters"""
         return self.params.copy()
     
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class EMACrossStrategy(Strategy):
+    """Dynamic EMA Crossover strategy for gold trading"""
+    def __init__(self):
+        self.params = {
+            'base_fast_period': 12,     # Base fast EMA period
+            'base_slow_period': 26,     # Base slow EMA period
+            'vol_window': 20,           # Volatility measurement window
+            'vol_threshold': 0.15,      # Volatility threshold for adjustment
+            'max_period_adjust': 0.5,   # Maximum period adjustment factor
+            'min_period_adjust': -0.3   # Minimum period adjustment factor
+        }
+        self.position = None
+        self.last_crossover = None
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze price data using dynamic EMA crossover"""
+        if len(data) < self.params['base_slow_period'] + self.params['vol_window']:
+            return {'valid': False}
+            
+        # Calculate volatility
+        volatility = data['close'].pct_change().rolling(
+            window=self.params['vol_window']
+        ).std()
+        
+        # Adjust EMA periods based on volatility
+        vol_factor = self._calculate_volatility_factor(volatility.iloc[-1])
+        fast_period = max(2, int(self.params['base_fast_period'] * (1 + vol_factor)))
+        slow_period = max(5, int(self.params['base_slow_period'] * (1 + vol_factor)))
+        
+        # Calculate EMAs
+        fast_ema = self._calculate_ema(data['close'], fast_period)
+        slow_ema = self._calculate_ema(data['close'], slow_period)
+        
+        # Detect crossovers
+        crossover = self._detect_crossover(fast_ema, slow_ema)
+        
+        return {
+            'valid': True,
+            'fast_ema': fast_ema,
+            'slow_ema': slow_ema,
+            'volatility': volatility,
+            'crossover': crossover,
+            'fast_period': fast_period,
+            'slow_period': slow_period,
+            'last_close': data['close'].iloc[-1],
+            'vol_factor': vol_factor
+        }
+        
+    def _calculate_volatility_factor(self, current_vol: float) -> float:
+        """Calculate period adjustment factor based on volatility"""
+        if current_vol > self.params['vol_threshold']:
+            # Higher volatility -> shorter periods
+            return max(
+                self.params['min_period_adjust'],
+                -current_vol / self.params['vol_threshold']
+            )
+        else:
+            # Lower volatility -> longer periods
+            return min(
+                self.params['max_period_adjust'],
+                (self.params['vol_threshold'] - current_vol) / self.params['vol_threshold']
+            )
+            
+    def _calculate_ema(self, data: pd.Series, period: int) -> pd.Series:
+        """Calculate EMA with specified period"""
+        alpha = 2.0 / (period + 1)
+        return data.ewm(alpha=alpha, adjust=False).mean()
+        
+    def _detect_crossover(self, fast_ema: pd.Series, slow_ema: pd.Series) -> Optional[str]:
+        """Detect EMA crossovers"""
+        if len(fast_ema) < 2 or len(slow_ema) < 2:
+            return None
+            
+        prev_diff = fast_ema.iloc[-2] - slow_ema.iloc[-2]
+        curr_diff = fast_ema.iloc[-1] - slow_ema.iloc[-1]
+        
+        if prev_diff < 0 and curr_diff > 0:
+            return 'bullish'
+        elif prev_diff > 0 and curr_diff < 0:
+            return 'bearish'
+        return None
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on EMA crossovers"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        last_close = analysis['last_close']
+        crossover = analysis['crossover']
+        vol_factor = analysis['vol_factor']
+        
+        # Adjust position size based on volatility factor
+        base_size = CONFIG['max_position_size']
+        position_size = base_size * (1 - abs(vol_factor))  # Reduce size in extreme conditions
+        
+        # Generate signals based on crossovers
+        if crossover and crossover != self.last_crossover:
+            if crossover == 'bullish' and self.position is None:
+                signals.append({
+                    'direction': 'buy',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'ema_bullish_cross',
+                    'fast_period': analysis['fast_period'],
+                    'slow_period': analysis['slow_period']
+                })
+            elif crossover == 'bearish' and self.position is None:
+                signals.append({
+                    'direction': 'sell',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'ema_bearish_cross',
+                    'fast_period': analysis['fast_period'],
+                    'slow_period': analysis['slow_period']
+                })
+                
+            # Close existing positions on opposite crossover
+            elif self.position is not None:
+                if (crossover == 'bearish' and self.position['direction'] == 'buy') or \
+                   (crossover == 'bullish' and self.position['direction'] == 'sell'):
+                    signals.append({
+                        'direction': f"close_{self.position['direction']}",
+                        'size': self.position['size'],
+                        'price': last_close,
+                        'reason': f'ema_{crossover}_cross'
+                    })
+                    self.position = None
+                    
+        self.last_crossover = crossover
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class BollingerADXStrategy(Strategy):
+    """Bollinger Bands with ADX trend confirmation strategy"""
+    def __init__(self):
+        self.params = {
+            'bb_period': 20,        # Bollinger Bands period
+            'bb_std': 2,           # Number of standard deviations
+            'adx_period': 14,      # ADX period
+            'adx_threshold': 25,    # ADX trend strength threshold
+            'pos_di_threshold': 20, # Positive DI threshold
+            'neg_di_threshold': 20  # Negative DI threshold
+        }
+        self.position = None
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze price data using Bollinger Bands and ADX"""
+        if len(data) < max(self.params['bb_period'], self.params['adx_period']):
+            return {'valid': False}
+            
+        # Calculate Bollinger Bands
+        middle_band = data['close'].rolling(window=self.params['bb_period']).mean()
+        std_dev = data['close'].rolling(window=self.params['bb_period']).std()
+        upper_band = middle_band + (std_dev * self.params['bb_std'])
+        lower_band = middle_band - (std_dev * self.params['bb_std'])
+        
+        # Calculate ADX components
+        high_low = data['high'] - data['low']
+        high_close = abs(data['high'] - data['close'].shift())
+        low_close = abs(data['low'] - data['close'].shift())
+        
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(window=self.params['adx_period']).mean()
+        
+        # Calculate +DM and -DM
+        plus_dm = data['high'].diff()
+        minus_dm = -data['low'].diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        # Smooth DM values
+        plus_di = 100 * (plus_dm.rolling(window=self.params['adx_period']).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=self.params['adx_period']).mean() / atr)
+        
+        # Calculate ADX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=self.params['adx_period']).mean()
+        
+        # Calculate %B (position within Bollinger Bands)
+        percent_b = (data['close'] - lower_band) / (upper_band - lower_band)
+        
+        return {
+            'valid': True,
+            'upper_band': upper_band,
+            'lower_band': lower_band,
+            'middle_band': middle_band,
+            'adx': adx,
+            'plus_di': plus_di,
+            'minus_di': minus_di,
+            'percent_b': percent_b,
+            'last_close': data['close'].iloc[-1],
+            'bb_width': (upper_band - lower_band) / middle_band
+        }
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on Bollinger Bands and ADX"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        last_close = analysis['last_close']
+        last_adx = analysis['adx'].iloc[-1]
+        last_plus_di = analysis['plus_di'].iloc[-1]
+        last_minus_di = analysis['minus_di'].iloc[-1]
+        last_percent_b = analysis['percent_b'].iloc[-1]
+        bb_width = analysis['bb_width'].iloc[-1]
+        
+        # Calculate position size based on ADX strength and BB width
+        base_size = CONFIG['max_position_size']
+        adx_factor = min(1.0, last_adx / 50.0)  # Scale by ADX strength
+        bb_factor = min(1.0, 1.0 / bb_width)    # Reduce size when bands widen
+        position_size = base_size * adx_factor * bb_factor
+        
+        # Generate signals based on BB position and ADX confirmation
+        if self.position is None:  # No current position
+            if (last_percent_b < 0.1 and  # Price near lower band
+                last_adx > self.params['adx_threshold'] and  # Strong trend
+                last_plus_di > self.params['pos_di_threshold']):  # Bullish momentum
+                signals.append({
+                    'direction': 'buy',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'bb_adx_buy',
+                    'adx': last_adx,
+                    'percent_b': last_percent_b
+                })
+            elif (last_percent_b > 0.9 and  # Price near upper band
+                  last_adx > self.params['adx_threshold'] and  # Strong trend
+                  last_minus_di > self.params['neg_di_threshold']):  # Bearish momentum
+                signals.append({
+                    'direction': 'sell',
+                    'size': position_size,
+                    'price': last_close,
+                    'reason': 'bb_adx_sell',
+                    'adx': last_adx,
+                    'percent_b': last_percent_b
+                })
+        else:  # Managing existing position
+            if self.position['direction'] == 'buy':
+                if (last_percent_b > 0.8 or  # Price near upper band
+                    last_minus_di > last_plus_di):  # Bearish crossover
+                    signals.append({
+                        'direction': 'close_buy',
+                        'size': self.position['size'],
+                        'price': last_close,
+                        'reason': 'bb_adx_take_profit'
+                    })
+                    self.position = None
+            elif self.position['direction'] == 'sell':
+                if (last_percent_b < 0.2 or  # Price near lower band
+                    last_plus_di > last_minus_di):  # Bullish crossover
+                    signals.append({
+                        'direction': 'close_sell',
+                        'size': self.position['size'],
+                        'price': last_close,
+                        'reason': 'bb_adx_take_profit'
+                    })
+                    self.position = None
+        
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
     def set_parameters(self, params: Dict[str, Any]) -> None:
         """Update strategy parameters"""
         self.params.update(params)
