@@ -6,7 +6,9 @@ import logging
 import json
 import sys
 import psutil
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, ClassVar
+import pytest
+from pathlib import Path
 
 # Configuration and Constants
 CONFIG = {
@@ -174,6 +176,27 @@ class UserPreferences:
             logging.error(f"Error updating preference: {str(e)}")
             return False
 
+class TestSupport:
+    """Test support functionality for development"""
+    _instance: ClassVar[Optional['TestSupport']] = None
+    
+    def __init__(self):
+        self.mock_data: Dict[str, Any] = {}
+        self.is_test_mode = False
+    
+    @classmethod
+    def get_instance(cls) -> 'TestSupport':
+        if cls._instance is None:
+            cls._instance = TestSupport()
+        return cls._instance
+    
+    def enable_test_mode(self):
+        self.is_test_mode = True
+        logging.info("Test mode enabled")
+    
+    def set_mock_data(self, key: str, value: Any):
+        self.mock_data[key] = value
+
 class GoldTradingBot:
     def __init__(self):
         self.compliance = ComplianceCheck()
@@ -181,10 +204,15 @@ class GoldTradingBot:
         self.user_preferences = UserPreferences()
         self.resource_check = ResourceCheck()
         self.ml_models = {}
+        self.test_support = TestSupport.get_instance()
         logging.basicConfig(level=logging.INFO)
         
     def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
+        if self.test_support.is_test_mode:
+            logging.info("Initializing in test mode")
+            return True
+            
         # Check system resources
         sys_check, sys_msg = ResourceCheck.check_system_resources()
         if not sys_check:
@@ -240,6 +268,11 @@ class GoldTradingBot:
             logging.error("Bot not initialized")
             return None
             
+        if self.test_support.is_test_mode:
+            mock_data = self.test_support.mock_data.get('gold_data')
+            if mock_data is not None:
+                return pd.DataFrame(mock_data)
+                
         timeframe = self.user_preferences.preferences["platform"]["default_timeframe"]
         rates = mt5.copy_rates_from_pos(CONFIG["symbol"], timeframe, 0, 100)
         if rates is None:
@@ -286,7 +319,30 @@ class GoldTradingBot:
             self.initialized = False
             logging.info("Bot shutdown completed")
 
+# Development helper functions
+def setup_development_env():
+    """Configure development environment"""
+    # Set up logging
+    log_path = Path("logs")
+    log_path.mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_path / "debug.log"),
+            logging.StreamHandler()
+        ]
+    )
+    
+    # Load environment variables
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        logging.warning("python-dotenv not installed, skipping .env loading")
+
 if __name__ == "__main__":
+    setup_development_env()
     bot = GoldTradingBot()
     try:
         if bot.initialize():
