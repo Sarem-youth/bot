@@ -545,6 +545,12 @@ class GoldTradingBot:
             RangeStrategy
         )
         
+        # Register Fibonacci strategy
+        self.plugin_manager.register_strategy(
+            'fibonacci',
+            FibonacciStrategy
+        )
+        
     async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
         if self.test_support.is_test_mode:
@@ -1366,6 +1372,206 @@ class RangeStrategy(Strategy):
                         'reason': 'range_take_profit'
                     })
                     self.position = None
+        
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class FibonacciStrategy(Strategy):
+    """Fibonacci retracement and breakout strategy"""
+    def __init__(self):
+        self.params = {
+            'trend_period': 20,        # Period to identify trend
+            'fib_levels': [0.236, 0.382, 0.5, 0.618, 0.786],  # Fibonacci levels
+            'breakout_threshold': 0.002,  # 0.2% breakout confirmation
+            'volume_factor': 1.5,      # Volume increase for breakout confirmation
+            'sr_period': 50,           # Period for S/R identification
+            'sr_threshold': 0.001      # 0.1% price cluster threshold
+        }
+        self.position = None
+        self.fib_levels = None
+        self.support_levels = []
+        self.resistance_levels = []
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze price data using Fibonacci retracements and S/R levels"""
+        if len(data) < max(self.params['trend_period'], self.params['sr_period']):
+            return {'valid': False}
+            
+        # Calculate Fibonacci levels
+        swing_high = data['high'].rolling(window=self.params['trend_period']).max()
+        swing_low = data['low'].rolling(window=self.params['trend_period']).min()
+        
+        # Identify trend direction
+        trend = 'up' if data['close'].iloc[-1] > data['close'].iloc[-self.params['trend_period']] else 'down'
+        
+        if trend == 'up':
+            fib_range = swing_high.iloc[-1] - swing_low.iloc[-1]
+            fib_levels = {level: swing_high.iloc[-1] - fib_range * level 
+                         for level in self.params['fib_levels']}
+        else:
+            fib_range = swing_high.iloc[-1] - swing_low.iloc[-1]
+            fib_levels = {level: swing_low.iloc[-1] + fib_range * level 
+                         for level in self.params['fib_levels']}
+        
+        # Identify support and resistance levels
+        self._update_support_resistance(data)
+        
+        # Check for breakouts
+        breakouts = self._detect_breakouts(data, fib_levels)
+        
+        # Calculate price distance to nearest levels
+        current_price = data['close'].iloc[-1]
+        nearest_fib = self._find_nearest_level(current_price, list(fib_levels.values()))
+        nearest_support = self._find_nearest_level(current_price, self.support_levels)
+        nearest_resistance = self._find_nearest_level(current_price, self.resistance_levels)
+        
+        return {
+            'valid': True,
+            'trend': trend,
+            'fib_levels': fib_levels,
+            'breakouts': breakouts,
+            'support_levels': self.support_levels,
+            'resistance_levels': self.resistance_levels,
+            'nearest_fib': nearest_fib,
+            'nearest_support': nearest_support,
+            'nearest_resistance': nearest_resistance,
+            'last_close': current_price,
+            'volume': data['tick_volume'].iloc[-1] if 'tick_volume' in data else None
+        }
+        
+    def _update_support_resistance(self, data: pd.DataFrame):
+        """Identify support and resistance levels using price clusters"""
+        price_clusters = []
+        window = self.params['sr_period']
+        
+        # Find price clusters
+        for i in range(window, len(data)):
+            subset = data.iloc[i-window:i]
+            highs = subset['high'].value_counts().sort_index()
+            lows = subset['low'].value_counts().sort_index()
+            
+            # Identify price levels with significant touches
+            for prices in [highs, lows]:
+                for price, count in prices.items():
+                    if count >= window * 0.1:  # At least 10% of periods
+                        if not any(abs(p - price) < self.params['sr_threshold'] for p in price_clusters):
+                            price_clusters.append(price)
+        
+        current_price = data['close'].iloc[-1]
+        self.support_levels = [p for p in price_clusters if p < current_price]
+        self.resistance_levels = [p for p in price_clusters if p > current_price]
+        
+    def _detect_breakouts(self, data: pd.DataFrame, fib_levels: Dict[float, float]) -> List[Dict[str, Any]]:
+        """Detect breakouts of Fibonacci and S/R levels"""
+        breakouts = []
+        current_price = data['close'].iloc[-1]
+        prev_price = data['close'].iloc[-2]
+        current_volume = data['tick_volume'].iloc[-1] if 'tick_volume' in data else None
+        avg_volume = data['tick_volume'].rolling(20).mean().iloc[-1] if 'tick_volume' in data else None
+        
+        # Check Fibonacci level breakouts
+        for level, price in fib_levels.items():
+            if (prev_price < price < current_price or 
+                prev_price > price > current_price):
+                breakouts.append({
+                    'type': 'fibonacci',
+                    'level': level,
+                    'price': price,
+                    'direction': 'up' if current_price > price else 'down'
+                })
+        
+        # Check S/R level breakouts
+        for level in self.support_levels + self.resistance_levels:
+            if (prev_price < level < current_price or 
+                prev_price > level > current_price):
+                # Confirm with volume if available
+                volume_confirmed = (current_volume > avg_volume * self.params['volume_factor'] 
+                                 if current_volume and avg_volume else True)
+                if volume_confirmed:
+                    breakouts.append({
+                        'type': 'sr',
+                        'price': level,
+                        'direction': 'up' if current_price > level else 'down'
+                    })
+        
+        return breakouts
+        
+    def _find_nearest_level(self, price: float, levels: List[float]) -> Optional[float]:
+        """Find the nearest price level"""
+        if not levels:
+            return None
+        return min(levels, key=lambda x: abs(x - price))
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on Fibonacci and breakout analysis"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        current_price = analysis['last_close']
+        
+        # Calculate position size based on proximity to key levels
+        base_size = CONFIG['max_position_size']
+        level_proximity = min(
+            abs(current_price - analysis['nearest_support']) / current_price if analysis['nearest_support'] else 1,
+            abs(current_price - analysis['nearest_resistance']) / current_price if analysis['nearest_resistance'] else 1
+        )
+        position_size = base_size * (1 - level_proximity)  # Larger size when closer to levels
+        
+        # Generate signals based on breakouts
+        if not self.position:  # No current position
+            for breakout in analysis['breakouts']:
+                if breakout['direction'] == 'up' and breakout['type'] == 'sr':
+                    signals.append({
+                        'direction': 'buy',
+                        'size': position_size,
+                        'price': current_price,
+                        'reason': f'breakout_{breakout["type"]}',
+                        'level': breakout['price']
+                    })
+                elif breakout['direction'] == 'down' and breakout['type'] == 'sr':
+                    signals.append({
+                        'direction': 'sell',
+                        'size': position_size,
+                        'price': current_price,
+                        'reason': f'breakout_{breakout["type"]}',
+                        'level': breakout['price']
+                    })
+        
+        # Manage existing positions
+        else:
+            if self.position['direction'] == 'buy':
+                # Close long if price breaks below support or Fibonacci level
+                for breakout in analysis['breakouts']:
+                    if breakout['direction'] == 'down':
+                        signals.append({
+                            'direction': 'close_buy',
+                            'size': self.position['size'],
+                            'price': current_price,
+                            'reason': f'breakdown_{breakout["type"]}'
+                        })
+                        self.position = None
+                        break
+                        
+            elif self.position['direction'] == 'sell':
+                # Close short if price breaks above resistance or Fibonacci level
+                for breakout in analysis['breakouts']:
+                    if breakout['direction'] == 'up':
+                        signals.append({
+                            'direction': 'close_sell',
+                            'size': self.position['size'],
+                            'price': current_price,
+                            'reason': f'breakout_{breakout["type"]}'
+                        })
+                        self.position = None
+                        break
         
         return signals
         
