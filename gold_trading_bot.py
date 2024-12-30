@@ -551,6 +551,12 @@ class GoldTradingBot:
             FibonacciStrategy
         )
         
+        # Register Event-Driven strategy
+        self.plugin_manager.register_strategy(
+            'event_driven',
+            EventDrivenStrategy
+        )
+        
     async def initialize(self) -> bool:
         """Initialize connection to MT5 and verify resources"""
         if self.test_support.is_test_mode:
@@ -1573,6 +1579,257 @@ class FibonacciStrategy(Strategy):
                         self.position = None
                         break
         
+        return signals
+        
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class EventDrivenStrategy(Strategy):
+    """Event-driven trading strategy using news and sentiment analysis"""
+    def __init__(self):
+        self.params = {
+            'sentiment_threshold': 0.6,    # Minimum sentiment score to trigger
+            'news_lookback': 30,          # Minutes to look back for news
+            'volume_surge_factor': 2.0,    # Volume increase to confirm impact
+            'position_hold_time': 60,      # Minutes to hold event-based positions
+            'keywords': {                  # Keywords and their importance weights
+                'inflation': 0.8,
+                'fed': 0.9,
+                'interest rate': 0.85,
+                'central bank': 0.8,
+                'gdp': 0.7,
+                'recession': 0.75,
+                'geopolitical': 0.7
+            }
+        }
+        self.position = None
+        self.last_news_check = None
+        self.position_entry_time = None
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze market data and news sentiment"""
+        if len(data) < 20:  # Minimum data requirement
+            return {'valid': False}
+            
+        # Get recent news and calculate sentiment
+        news_data = self._fetch_recent_news()
+        sentiment_scores = self._analyze_sentiment(news_data)
+        
+        # Calculate market impact indicators
+        volume_ma = data['tick_volume'].rolling(20).mean() if 'tick_volume' in data else None
+        current_volume = data['tick_volume'].iloc[-1] if 'tick_volume' in data else None
+        
+        # Detect volatility surge
+        volatility = data['close'].pct_change().std() * np.sqrt(252)
+        vol_surge = volatility > data['close'].pct_change().rolling(20).std().mean() * 2
+        
+        # Identify significant events
+        significant_events = self._identify_significant_events(news_data, sentiment_scores)
+        
+        # Calculate event impact score
+        impact_score = self._calculate_impact_score(
+            significant_events,
+            vol_surge,
+            current_volume,
+            volume_ma
+        )
+        
+        return {
+            'valid': True,
+            'sentiment_scores': sentiment_scores,
+            'significant_events': significant_events,
+            'impact_score': impact_score,
+            'volatility': volatility,
+            'volume_surge': vol_surge,
+            'last_close': data['close'].iloc[-1],
+            'current_volume': current_volume,
+            'avg_volume': volume_ma.iloc[-1] if volume_ma is not None else None
+        }
+        
+    def _fetch_recent_news(self) -> List[Dict[str, Any]]:
+        """Fetch recent news articles about gold"""
+        if not self.last_news_check:
+            self.last_news_check = datetime.now()
+            return []
+            
+        # Filter news within lookback period
+        lookback_time = datetime.now() - timedelta(minutes=self.params['news_lookback'])
+        
+        try:
+            news_api = NewsAPI()  # Using existing NewsAPI class
+            news = asyncio.get_event_loop().run_until_complete(news_api.get_gold_news())
+            
+            recent_news = [
+                article for article in news
+                if datetime.fromisoformat(article['published_at']) > lookback_time
+            ]
+            
+            self.last_news_check = datetime.now()
+            return recent_news
+        except Exception as e:
+            logging.error(f"Error fetching news: {str(e)}")
+            return []
+        
+    def _analyze_sentiment(self, news_data: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+        """Analyze sentiment of news articles"""
+        try:
+            from textblob import TextBlob
+            
+            sentiment_scores = []
+            for article in news_data:
+                # Analyze title and content
+                title_blob = TextBlob(article['title'])
+                content_blob = TextBlob(article['content']) if 'content' in article else TextBlob('')
+                
+                # Weight title more heavily than content
+                sentiment = (title_blob.sentiment.polarity * 0.6 + 
+                           content_blob.sentiment.polarity * 0.4)
+                
+                # Adjust sentiment based on keyword presence
+                keyword_score = self._calculate_keyword_score(
+                    article['title'] + ' ' + article.get('content', '')
+                )
+                
+                sentiment_scores.append({
+                    'article_id': article['id'],
+                    'sentiment': sentiment,
+                    'keyword_score': keyword_score,
+                    'timestamp': article['published_at']
+                })
+                
+            return sentiment_scores
+        except Exception as e:
+            logging.error(f"Sentiment analysis error: {str(e)}")
+            return []
+        
+    def _calculate_keyword_score(self, text: str) -> float:
+        """Calculate importance score based on keyword presence"""
+        text = text.lower()
+        score = 0.0
+        matches = 0
+        
+        for keyword, weight in self.params['keywords'].items():
+            if keyword in text:
+                score += weight
+                matches += 1
+                
+        return score / max(matches, 1)  # Average score if matches found
+        
+    def _identify_significant_events(self, news_data: List[Dict[str, Any]], 
+                                   sentiment_scores: List[Dict[str, float]]) -> List[Dict[str, Any]]:
+        """Identify significant market-moving events"""
+        significant_events = []
+        
+        for article, sentiment in zip(news_data, sentiment_scores):
+            # Check if sentiment exceeds threshold
+            if abs(sentiment['sentiment']) >= self.params['sentiment_threshold']:
+                event = {
+                    'id': article['id'],
+                    'title': article['title'],
+                    'sentiment': sentiment['sentiment'],
+                    'keyword_score': sentiment['keyword_score'],
+                    'timestamp': sentiment['timestamp'],
+                    'impact': 'high' if abs(sentiment['sentiment']) > 0.8 else 'medium'
+                }
+                significant_events.append(event)
+                
+        return significant_events
+        
+    def _calculate_impact_score(self, events: List[Dict[str, Any]], vol_surge: bool,
+                              current_volume: Optional[float], volume_ma: Optional[float]) -> float:
+        """Calculate overall market impact score"""
+        if not events:
+            return 0.0
+            
+        # Base score from events
+        event_score = sum(
+            abs(event['sentiment']) * event['keyword_score']
+            for event in events
+        ) / len(events)
+        
+        # Adjust for market conditions
+        if vol_surge:
+            event_score *= 1.5
+            
+        if current_volume and volume_ma:
+            volume_factor = current_volume / volume_ma
+            if volume_factor > self.params['volume_surge_factor']:
+                event_score *= volume_factor / self.params['volume_surge_factor']
+                
+        return min(1.0, event_score)  # Cap at 1.0
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate trading signals based on event analysis"""
+        if not analysis['valid'] or not analysis['significant_events']:
+            return []
+            
+        signals = []
+        current_price = analysis['last_close']
+        impact_score = analysis['impact_score']
+        
+        # Check if enough time has passed since last position
+        if self.position and self.position_entry_time:
+            hold_time = datetime.now() - self.position_entry_time
+            if hold_time.total_seconds() / 60 < self.params['position_hold_time']:
+                return []
+                
+        # Calculate position size based on impact score
+        base_size = CONFIG['max_position_size']
+        position_size = base_size * impact_score
+        
+        # Generate signals based on event analysis
+        if not self.position:  # No current position
+            net_sentiment = sum(
+                event['sentiment'] for event in analysis['significant_events']
+            ) / len(analysis['significant_events'])
+            
+            if net_sentiment > self.params['sentiment_threshold']:
+                signals.append({
+                    'direction': 'buy',
+                    'size': position_size,
+                    'price': current_price,
+                    'reason': 'positive_event',
+                    'impact_score': impact_score,
+                    'events': [e['title'] for e in analysis['significant_events']]
+                })
+                self.position_entry_time = datetime.now()
+                
+            elif net_sentiment < -self.params['sentiment_threshold']:
+                signals.append({
+                    'direction': 'sell',
+                    'size': position_size,
+                    'price': current_price,
+                    'reason': 'negative_event',
+                    'impact_score': impact_score,
+                    'events': [e['title'] for e in analysis['significant_events']]
+                })
+                self.position_entry_time = datetime.now()
+                
+        else:  # Managing existing position
+            # Close position if sentiment reverses
+            current_sentiment = sum(
+                event['sentiment'] for event in analysis['significant_events']
+            ) / len(analysis['significant_events'])
+            
+            if ((self.position['direction'] == 'buy' and 
+                 current_sentiment < -self.params['sentiment_threshold']) or
+                (self.position['direction'] == 'sell' and 
+                 current_sentiment > self.params['sentiment_threshold'])):
+                signals.append({
+                    'direction': f"close_{self.position['direction']}",
+                    'size': self.position['size'],
+                    'price': current_price,
+                    'reason': 'sentiment_reversal',
+                    'impact_score': impact_score
+                })
+                self.position = None
+                self.position_entry_time = None
+                
         return signals
         
     def get_parameters(self) -> Dict[str, Any]:
