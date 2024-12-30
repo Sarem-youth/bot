@@ -79,3 +79,115 @@ Advanced gold trading bot designed for automated trading on MT5 platform with fo
 - Risk management effectiveness
 - System stability
 - Performance monitoring capability
+
+## 7. Compliance Requirements
+### 7.1 KYC Integration
+- Broker API integration for KYC verification
+- Identity verification checks
+- Document validation system
+- Regular KYC status monitoring
+
+### 7.2 Tax Reporting
+- Transaction record keeping
+- Daily profit/loss tracking
+- Annual tax statement generation
+- Multi-jurisdiction tax compliance
+- Export functionality for tax reports
+
+### 7.3 Regulatory Compliance
+- Integration with regulated brokers only
+- Trade reporting requirements
+- Risk disclosure implementation
+- Anti-money laundering (AML) checks
+- Market manipulation prevention
+- Maximum leverage restrictions
+- Position limits monitoring
+
+### 7.4 Data Protection
+- GDPR compliance
+- Data retention policies
+- User data encryption
+- Audit trail maintenance
+- Secure data disposal procedures
+
+## 8. User Needs Specification
+### 8.1 Trading Platform Preferences
+- MT5 platform integration
+- Web-based dashboard access
+- Mobile app compatibility
+- Custom alerts configuration
+- Multiple device synchronization
+- Preferred chart timeframes (M1, M5, M15, H1, H4, D1)
+
+### 8.2 Strategy Customization
+- Technical indicator selection
+  * Moving averages (SMA, EMA)
+  * RSI ranges
+  * MACD parameters
+  * Bollinger Bands settings
+- Entry/exit rule configuration
+- Multiple strategy deployment
+- Backtesting capabilities
+- Strategy performance metrics
+
+### 8.3 Risk Management Preferences
+- Account-based position sizing
+- Maximum drawdown settings
+- Daily loss limits
+- Risk-reward ratio settings
+- Maximum trades per day
+- Overnight position handling
+- Weekend exposure limits
+
+### 8.4 Reporting Preferences
+- Real-time performance dashboard
+- Daily summary reports
+- Weekly performance analysis
+- Monthly tax reports
+- Custom period analysis
+- Export format options (PDF, CSV, Excel)
+
+## 9. Technical Resource Setup
+### 9.1 Programming Languages
+- Primary: Python 3.8+ (Core trading logic)
+  * NumPy/Pandas for data analysis
+  * Scikit-learn for ML models
+  * TensorFlow/Keras for deep learning
+  * MetaTrader5 library for MT5 integration
+- Secondary: MQL5 (MT5 specific features)
+  * Custom indicator development
+  * Expert Advisor integration
+  * Direct market access
+
+### 9.2 Frameworks & Libraries
+#### 9.2.1 Data Processing
+- pandas_ta: Technical analysis
+- numpy: Numerical computations
+- scipy: Statistical analysis
+- yfinance: Market data fetching
+
+#### 9.2.2 Machine Learning
+- scikit-learn: Traditional ML models
+- tensorflow: Deep learning models
+- keras: Neural network building
+- nltk: Sentiment analysis
+
+#### 9.2.3 Trading Integration
+- MetaTrader5: Main trading platform
+- ccxt: Crypto exchange integration
+- ta-lib: Technical analysis
+- pymongo: Database operations
+
+### 9.3 Hardware Requirements
+- Minimum CPU: 4 cores
+- Recommended RAM: 16GB+
+- Storage: 256GB SSD
+- Network: Low-latency connection
+- Backup power supply
+
+### 9.4 Development Environment
+- IDE: PyCharm/VSCode
+- Version Control: Git
+- CI/CD: Jenkins/GitHub Actions
+- Testing: pytest
+- Code Quality: flake8, mypy
