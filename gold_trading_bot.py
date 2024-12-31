@@ -107,6 +107,14 @@ API_CONFIG = {
     }
 }
 
+ORDER_BOOK_CONFIG = {
+    'max_depth': 10,          # Maximum depth levels to analyze
+    'update_interval': 0.1,   # Seconds between updates
+    'imbalance_threshold': 0.2,  # Minimum imbalance to trigger signal
+    'volume_levels': [0.25, 0.5, 0.75],  # Volume profile analysis levels
+    'liquidity_threshold': 100  # Minimum liquidity required
+}
+
 class ComplianceCheck:
     def __init__(self):
         self.kyc_status = False
@@ -504,6 +512,205 @@ class CustomizationManager:
         """Load strategy template"""
         return self.templates.get(name)
 
+class OrderBookAnalyzer:
+    """Analyze order book for price prediction"""
+    def __init__(self):
+        self.depth_cache = {
+            'asks': {},  # price -> volume
+            'bids': {},
+            'timestamp': None
+        }
+        self.recent_imbalances = []
+        self.vwap_levels = []
+        
+    def update_depth(self, depth_data: Dict[str, Dict[float, float]]):
+        """Update order book depth cache"""
+        if not depth_data.get('asks') or not depth_data.get('bids'):
+            return
+            
+        self.depth_cache = {
+            'asks': {float(p): float(v) for p, v in depth_data['asks'].items()},
+            'bids': {float(p): float(v) for p, v in depth_data['bids'].items()},
+            'timestamp': datetime.now()
+        }
+        
+    def analyze_depth(self) -> Dict[str, Any]:
+        """Analyze current order book state"""
+        if not self._is_depth_valid():
+            return {'valid': False}
+            
+        # Calculate order book imbalance
+        imbalance = self._calculate_imbalance()
+        
+        # Analyze volume distribution
+        volume_profile = self._analyze_volume_profile()
+        
+        # Calculate VWAP levels
+        vwap = self._calculate_vwap_levels()
+        
+        # Detect potential walls
+        walls = self._detect_price_walls()
+        
+        return {
+            'valid': True,
+            'imbalance': imbalance,
+            'volume_profile': volume_profile,
+            'vwap_levels': vwap,
+            'walls': walls,
+            'timestamp': self.depth_cache['timestamp']
+        }
+        
+    def _is_depth_valid(self) -> bool:
+        """Check if depth data is valid and recent"""
+        if not self.depth_cache['timestamp']:
+            return False
+            
+        age = (datetime.now() - self.depth_cache['timestamp']).total_seconds()
+        return age < ORDER_BOOK_CONFIG['update_interval'] * 10
+        
+    def _calculate_imbalance(self) -> Dict[str, float]:
+        """Calculate order book imbalance metrics"""
+        bid_volume = sum(self.depth_cache['bids'].values())
+        ask_volume = sum(self.depth_cache['asks'].values())
+        total_volume = bid_volume + ask_volume
+        
+        if total_volume == 0:
+            return {'raw': 0.0, 'normalized': 0.0}
+            
+        raw_imbalance = (bid_volume - ask_volume) / total_volume
+        
+        # Track recent imbalances
+        self.recent_imbalances.append(raw_imbalance)
+        if len(self.recent_imbalances) > 20:
+            self.recent_imbalances.pop(0)
+            
+        # Calculate normalized imbalance
+        normalized_imbalance = (
+            raw_imbalance / max(abs(min(self.recent_imbalances)),
+                              abs(max(self.recent_imbalances)), 1)
+        )
+        
+        return {
+            'raw': raw_imbalance,
+            'normalized': normalized_imbalance
+        }
+        
+    def _analyze_volume_profile(self) -> Dict[str, Any]:
+        """Analyze volume distribution across price levels"""
+        all_volumes = sorted(
+            list(self.depth_cache['asks'].values()) +
+            list(self.depth_cache['bids'].values())
+        )
+        
+        volume_levels = {}
+        for percentile in ORDER_BOOK_CONFIG['volume_levels']:
+            idx = int(len(all_volumes) * percentile)
+            if idx < len(all_volumes):
+                volume_levels[str(percentile)] = all_volumes[idx]
+            
+        return {
+            'levels': volume_levels,
+            'max_volume': max(all_volumes) if all_volumes else 0
+        }
+        
+    def _calculate_vwap_levels(self) -> List[float]:
+        """Calculate VWAP at different depth levels"""
+        vwap_levels = []
+        
+        for depth in range(1, ORDER_BOOK_CONFIG['max_depth'] + 1):
+            bid_vwap = self._calculate_side_vwap('bids', depth)
+            ask_vwap = self._calculate_side_vwap('asks', depth)
+            
+            if bid_vwap and ask_vwap:
+                mid_vwap = (bid_vwap + ask_vwap) / 2
+                vwap_levels.append(mid_vwap)
+                
+        self.vwap_levels = vwap_levels
+        return vwap_levels
+        
+    def _calculate_side_vwap(self, side: str, depth: int) -> Optional[float]:
+        """Calculate VWAP for one side of the book"""
+        orders = list(self.depth_cache[side].items())[:depth]
+        if not orders:
+            return None
+            
+        total_volume = sum(volume for _, volume in orders)
+        if total_volume == 0:
+            return None
+            
+        vwap = sum(price * volume for price, volume in orders) / total_volume
+        return vwap
+        
+    def _detect_price_walls(self) -> List[Dict[str, Any]]:
+        """Detect significant liquidity walls"""
+        walls = []
+        
+        for side in ['bids', 'asks']:
+            orders = sorted(
+                self.depth_cache[side].items(),
+                key=lambda x: float(x[1]),
+                reverse=True
+            )
+            
+            # Find price levels with significantly higher volume
+            avg_volume = sum(v for _, v in orders) / len(orders) if orders else 0
+            
+            for price, volume in orders:
+                if volume > avg_volume * 2:  # Significant wall
+                    walls.append({
+                        'side': side,
+                        'price': price,
+                        'volume': volume,
+                        'strength': volume / avg_volume
+                    })
+                    
+        return sorted(walls, key=lambda x: x['strength'], reverse=True)
+        
+    def predict_price_movement(self) -> Optional[Dict[str, Any]]:
+        """Predict potential price movement based on order book"""
+        if not self._is_depth_valid():
+            return None
+            
+        analysis = self.analyze_depth()
+        if not analysis['valid']:
+            return None
+            
+        # Combined analysis for price prediction
+        imbalance = analysis['imbalance']['normalized']
+        walls = analysis['walls']
+        
+        prediction = {
+            'direction': None,
+            'strength': 0.0,
+            'confidence': 0.0,
+            'resistance': None,
+            'support': None
+        }
+        
+        # Predict based on imbalance
+        if abs(imbalance) > ORDER_BOOK_CONFIG['imbalance_threshold']:
+            prediction['direction'] = 'up' if imbalance > 0 else 'down'
+            prediction['strength'] = abs(imbalance)
+            
+        # Identify support/resistance from walls
+        for wall in walls:
+            if wall['strength'] > 2:  # Significant wall
+                if wall['side'] == 'asks':
+                    prediction['resistance'] = wall['price']
+                else:
+                    prediction['support'] = wall['price']
+                    
+        # Calculate confidence
+        signals = [
+            abs(imbalance) > ORDER_BOOK_CONFIG['imbalance_threshold'],
+            bool(prediction['resistance'] or prediction['support']),
+            bool(analysis['volume_profile']['max_volume'] > 
+                ORDER_BOOK_CONFIG['liquidity_threshold'])
+        ]
+        prediction['confidence'] = sum(signals) / len(signals)
+        
+        return prediction
+
 class GoldTradingBot:
     def __init__(self):
         self.compliance = ComplianceCheck()
@@ -519,6 +726,7 @@ class GoldTradingBot:
         self.plugin_manager = PluginManager()
         self.customization_manager = CustomizationManager()
         self.active_strategies: Dict[str, Strategy] = {}
+        self.order_book = OrderBookAnalyzer()
         logging.basicConfig(level=logging.INFO)
         
         # Register AMA strategy
@@ -743,6 +951,28 @@ class GoldTradingBot:
                 position_size = self._calculate_adaptive_position_size(market_condition)
                 logging.info(f"Adapted position size: {position_size}")
                 # Implement trading logic here
+
+            # Get order book data
+            depth_data = mt5.market_book_get(CONFIG['symbol'])
+            if depth_data:
+                formatted_depth = {
+                    'asks': {str(entry.price): entry.volume_real 
+                            for entry in depth_data if entry.type == mt5.BOOK_TYPE_SELL},
+                    'bids': {str(entry.price): entry.volume_real 
+                            for entry in depth_data if entry.type == mt5.BOOK_TYPE_BUY}
+                }
+                self.order_book.update_depth(formatted_depth)
+            
+            # Get order book prediction
+            prediction = self.order_book.predict_price_movement()
+            if prediction and prediction['confidence'] > 0.7:
+                logging.info(f"Order book prediction: {prediction}")
+                # Adjust position sizing based on prediction confidence
+                if self.position and prediction['direction']:
+                    if ((self.position['direction'] == 'buy' and prediction['direction'] == 'down') or
+                        (self.position['direction'] == 'sell' and prediction['direction'] == 'up')):
+                        # Consider closing position
+                        pass
                 
         except Exception as e:
             logging.error(f"Trading cycle error: {str(e)}")
