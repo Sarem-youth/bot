@@ -569,6 +569,12 @@ class GoldTradingBot:
             VolatilityBreakoutStrategy
         )
         
+        # Register Scalping strategy
+        self.plugin_manager.register_strategy(
+            'scalping',
+            ScalpingStrategy
+        )
+        
         # Add ATR Risk Manager
         self.risk_manager = ATRRiskManager()
         
@@ -2481,6 +2487,235 @@ class VolatilityBreakoutStrategy(Strategy):
                     
         return signals
         
+    def get_parameters(self) -> Dict[str, Any]:
+        """Get strategy parameters"""
+        return self.params.copy()
+        
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        """Update strategy parameters"""
+        self.params.update(params)
+
+class ScalpingStrategy(Strategy):
+    """High-frequency scalping strategy for gold trading"""
+    def __init__(self):
+        self.params = {
+            'tick_window': 100,        # Number of ticks to analyze
+            'price_threshold': 0.0001,  # Minimum price movement
+            'volume_threshold': 1.5,    # Volume surge multiplier
+            'max_spread': 0.00015,     # Maximum allowed spread
+            'min_tick_sequence': 3,     # Minimum ticks in same direction
+            'take_profit_ticks': 5,     # Take profit in ticks
+            'stop_loss_ticks': 3,       # Stop loss in ticks
+            'max_hold_time': 30,        # Maximum position hold time (seconds)
+            'min_tick_volume': 10       # Minimum tick volume
+        }
+        self.position = None
+        self.position_time = None
+        self.tick_buffer = []
+        
+    def analyze(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze tick data for scalping opportunities"""
+        if len(data) < self.params['tick_window']:
+            return {'valid': False}
+            
+        # Calculate tick-by-tick metrics
+        tick_changes = data['ask'].diff()
+        tick_volumes = data['tick_volume']
+        spreads = data['ask'] - data['bid']
+        
+        # Detect price momentum
+        momentum = self._analyze_momentum(tick_changes)
+        
+        # Analyze volume profile
+        volume_profile = self._analyze_volume(tick_volumes)
+        
+        # Check orderbook imbalance (if available)
+        imbalance = self._check_orderbook_imbalance(data)
+        
+        # Calculate tick volatility
+        volatility = self._calculate_tick_volatility(tick_changes)
+        
+        return {
+            'valid': True,
+            'momentum': momentum,
+            'volume_profile': volume_profile,
+            'imbalance': imbalance,
+            'volatility': volatility,
+            'current_spread': spreads.iloc[-1],
+            'last_ask': data['ask'].iloc[-1],
+            'last_bid': data['bid'].iloc[-1],
+            'tick_volume': tick_volumes.iloc[-1]
+        }
+        
+    def _analyze_momentum(self, tick_changes: pd.Series) -> Dict[str, Any]:
+        """Analyze price momentum in recent ticks"""
+        recent_changes = tick_changes.tail(self.params['min_tick_sequence'])
+        
+        # Count consecutive moves
+        up_ticks = (recent_changes > self.params['price_threshold']).sum()
+        down_ticks = (recent_changes < -self.params['price_threshold']).sum()
+        
+        # Calculate momentum strength
+        momentum_strength = abs(up_ticks - down_ticks) / self.params['min_tick_sequence']
+        direction = 'up' if up_ticks > down_ticks else 'down'
+        
+        return {
+            'direction': direction,
+            'strength': momentum_strength,
+            'consecutive_moves': max(up_ticks, down_ticks)
+        }
+        
+    def _analyze_volume(self, tick_volumes: pd.Series) -> Dict[str, Any]:
+        """Analyze recent volume profile"""
+        recent_volume = tick_volumes.tail(20)  # Last 20 ticks
+        avg_volume = tick_volumes.mean()
+        
+        return {
+            'current_volume': recent_volume.iloc[-1],
+            'volume_surge': recent_volume.iloc[-1] / avg_volume,
+            'rising_volume': recent_volume.is_monotonic_increasing
+        }
+        
+    def _check_orderbook_imbalance(self, data: pd.DataFrame) -> float:
+        """Check order book imbalance if depth data available"""
+        if 'ask_volume' in data and 'bid_volume' in data:
+            ask_volume = data['ask_volume'].iloc[-1]
+            bid_volume = data['bid_volume'].iloc[-1]
+            total_volume = ask_volume + bid_volume
+            
+            if total_volume > 0:
+                return (bid_volume - ask_volume) / total_volume
+        return 0.0
+        
+    def _calculate_tick_volatility(self, tick_changes: pd.Series) -> float:
+        """Calculate recent tick volatility"""
+        return tick_changes.tail(50).std()
+        
+    def generate_signals(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate scalping signals based on tick analysis"""
+        if not analysis['valid']:
+            return []
+            
+        signals = []
+        momentum = analysis['momentum']
+        volume = analysis['volume_profile']
+        
+        # Check if spread is acceptable
+        if analysis['current_spread'] > self.params['max_spread']:
+            return []
+            
+        # Calculate scalping position size
+        base_size = CONFIG['max_position_size'] * 0.1  # Smaller size for scalping
+        position_size = self._calculate_scalp_size(
+            base_size=base_size,
+            momentum_strength=momentum['strength'],
+            volume_ratio=volume['volume_surge']
+        )
+        
+        # Generate entry signals
+        if not self.position:
+            if self._check_entry_conditions(analysis):
+                entry_price = analysis['last_ask'] if momentum['direction'] == 'up' else analysis['last_bid']
+                
+                signals.append({
+                    'direction': 'buy' if momentum['direction'] == 'up' else 'sell',
+                    'size': position_size,
+                    'price': entry_price,
+                    'stop_loss': self._calculate_stop_level(
+                        entry_price,
+                        momentum['direction'],
+                        analysis['volatility']
+                    ),
+                    'take_profit': self._calculate_target_level(
+                        entry_price,
+                        momentum['direction'],
+                        analysis['volatility']
+                    ),
+                    'reason': f"scalp_{momentum['direction']}"
+                })
+                self.position_time = datetime.now()
+                
+        # Manage existing position
+        else:
+            if self._check_exit_conditions(analysis):
+                exit_price = analysis['last_bid'] if self.position['direction'] == 'buy' else analysis['last_ask']
+                
+                signals.append({
+                    'direction': f"close_{self.position['direction']}",
+                    'size': self.position['size'],
+                    'price': exit_price,
+                    'reason': 'scalp_exit'
+                })
+                self.position = None
+                self.position_time = None
+                
+        return signals
+        
+    def _calculate_scalp_size(self, base_size: float, 
+                            momentum_strength: float,
+                            volume_ratio: float) -> float:
+        """Calculate position size for scalp trade"""
+        # Adjust size based on setup quality
+        momentum_factor = min(1.0, momentum_strength * 2)
+        volume_factor = min(1.0, volume_ratio / self.params['volume_threshold'])
+        
+        return base_size * momentum_factor * volume_factor
+        
+    def _check_entry_conditions(self, analysis: Dict[str, Any]) -> bool:
+        """Check if conditions are right for scalp entry"""
+        momentum = analysis['momentum']
+        volume = analysis['volume_profile']
+        
+        return (
+            momentum['consecutive_moves'] >= self.params['min_tick_sequence'] and
+            volume['volume_surge'] >= self.params['volume_threshold'] and
+            analysis['tick_volume'] >= self.params['min_tick_volume'] and
+            abs(analysis['imbalance']) >= 0.2  # Significant order book imbalance
+        )
+        
+    def _check_exit_conditions(self, analysis: Dict[str, Any]) -> bool:
+        """Check if position should be closed"""
+        if not self.position_time:
+            return False
+            
+        # Check hold time
+        hold_time = (datetime.now() - self.position_time).total_seconds()
+        if hold_time > self.params['max_hold_time']:
+            return True
+            
+        # Check momentum reversal
+        momentum = analysis['momentum']
+        if self.position['direction'] == 'buy' and momentum['direction'] == 'down':
+            if momentum['consecutive_moves'] >= 2:  # Quick reversal
+                return True
+        elif self.position['direction'] == 'sell' and momentum['direction'] == 'up':
+            if momentum['consecutive_moves'] >= 2:
+                return True
+                
+        return False
+        
+    def _calculate_stop_level(self, entry_price: float, 
+                            direction: str, volatility: float) -> float:
+        """Calculate adaptive stop-loss level"""
+        base_stop = self.params['stop_loss_ticks'] * 0.0001  # Base stop in pips
+        volatility_adjustment = min(0.0001, volatility * 2)  # Cap volatility adjustment
+        
+        if direction == 'up':
+            return entry_price - (base_stop + volatility_adjustment)
+        else:
+            return entry_price + (base_stop + volatility_adjustment)
+            
+    def _calculate_target_level(self, entry_price: float,
+                              direction: str, volatility: float) -> float:
+        """Calculate adaptive take-profit level"""
+        base_target = self.params['take_profit_ticks'] * 0.0001
+        volatility_adjustment = min(0.0001, volatility * 2)
+        
+        if direction == 'up':
+            return entry_price + (base_target + volatility_adjustment)
+        else:
+            return entry_price - (base_target + volatility_adjustment)
+            
     def get_parameters(self) -> Dict[str, Any]:
         """Get strategy parameters"""
         return self.params.copy()
