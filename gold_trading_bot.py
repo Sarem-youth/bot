@@ -115,6 +115,38 @@ ORDER_BOOK_CONFIG = {
     'liquidity_threshold': 100  # Minimum liquidity required
 }
 
+# Add after existing CONFIG blocks
+ML_CONFIG = {
+    'prediction_horizons': [5, 15, 60],  # Minutes ahead to predict
+    'retrain_interval': 24,  # Hours between model retraining
+    'min_train_samples': 1000,  # Minimum samples for training
+    'feature_windows': [5, 10, 20, 50],  # Historical windows for features
+    'confidence_threshold': 0.7,  # Minimum confidence for signals
+    'models': {
+        'linear': {
+            'enabled': True,
+            'weight': 0.3
+        },
+        'xgboost': {
+            'enabled': True,
+            'weight': 0.3,
+            'params': {
+                'max_depth': 6,
+                'learning_rate': 0.1,
+                'n_estimators': 100
+            }
+        },
+        'lstm': {
+            'enabled': True,
+            'weight': 0.4,
+            'layers': [64, 32, 16],
+            'dropout': 0.2,
+            'epochs': 50,
+            'batch_size': 32
+        }
+    }
+}
+
 class ComplianceCheck:
     def __init__(self):
         self.kyc_status = False
@@ -2953,3 +2985,156 @@ class ScalpingStrategy(Strategy):
     def set_parameters(self, params: Dict[str, Any]) -> None:
         """Update strategy parameters"""
         self.params.update(params)
+
+class PricePredictionModel:
+    """ML-based price prediction for gold"""
+    def __init__(self):
+        self.models = {}
+        self.scalers = {}
+        self.last_train_time = None
+        self.feature_importances = {}
+        self.prediction_metrics = {
+            'mse': [],
+            'mae': [],
+            'accuracy': []
+        }
+        
+    def prepare_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Create feature set for ML models"""
+        features = pd.DataFrame()
+        
+        # Technical indicators
+        for window in ML_CONFIG['feature_windows']:
+            # Price features
+            features[f'returns_{window}'] = data['close'].pct_change(window)
+            features[f'volatility_{window}'] = data['close'].pct_change().rolling(window).std()
+            features[f'rsi_{window}'] = self._calculate_rsi(data['close'], window)
+            
+            # Volume features
+            if 'volume' in data.columns:
+                features[f'volume_ma_{window}'] = data['volume'].rolling(window).mean()
+                features[f'volume_std_{window}'] = data['volume'].rolling(window).std()
+                
+        # Price differences
+        features['high_low_diff'] = (data['high'] - data['low']) / data['close']
+        features['close_open_diff'] = (data['close'] - data['open']) / data['open']
+        
+        # Time-based features
+        features['hour_of_day'] = data.index.hour
+        features['day_of_week'] = data.index.dayofweek
+        
+        return features.dropna()
+        
+    def _calculate_rsi(self, prices: pd.Series, window: int) -> pd.Series:
+        """Calculate Relative Strength Index (RSI)"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+        
+    def train_models(self, data: pd.DataFrame):
+        """Train ML models for price prediction"""
+        from sklearn.linear_model import LinearRegression
+        import xgboost as xgb
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense, Dropout
+        from sklearn.preprocessing import StandardScaler
+        
+        features = self.prepare_features(data)
+        targets = self._create_targets(data)
+        
+        # Scale features
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(features)
+        self.scalers['features'] = scaler
+        
+        # Train linear regression model
+        if ML_CONFIG['models']['linear']['enabled']:
+            linear_model = LinearRegression()
+            linear_model.fit(scaled_features, targets)
+            self.models['linear'] = linear_model
+            
+        # Train XGBoost model
+        if ML_CONFIG['models']['xgboost']['enabled']:
+            xgb_model = xgb.XGBRegressor(**ML_CONFIG['models']['xgboost']['params'])
+            xgb_model.fit(scaled_features, targets)
+            self.models['xgboost'] = xgb_model
+            
+        # Train LSTM model
+        if ML_CONFIG['models']['lstm']['enabled']:
+            lstm_model = Sequential()
+            for units in ML_CONFIG['models']['lstm']['layers']:
+                lstm_model.add(LSTM(units, return_sequences=True))
+                lstm_model.add(Dropout(ML_CONFIG['models']['lstm']['dropout']))
+            lstm_model.add(Dense(1))
+            lstm_model.compile(optimizer='adam', loss='mse')
+            
+            # Reshape features for LSTM
+            lstm_features = scaled_features.reshape((scaled_features.shape[0], 1, scaled_features.shape[1]))
+            lstm_model.fit(lstm_features, targets, 
+                           epochs=ML_CONFIG['models']['lstm']['epochs'], 
+                           batch_size=ML_CONFIG['models']['lstm']['batch_size'])
+            self.models['lstm'] = lstm_model
+            
+        self.last_train_time = datetime.now()
+        
+    def _create_targets(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Create target variables for prediction horizons"""
+        targets = pd.DataFrame()
+        for horizon in ML_CONFIG['prediction_horizons']:
+            targets[f'target_{horizon}'] = data['close'].shift(-horizon) / data['close'] - 1
+        return targets.dropna()
+        
+    def predict(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Predict future prices using trained models"""
+        if not self.models:
+            return {}
+            
+        features = self.prepare_features(data)
+        scaled_features = self.scalers['features'].transform(features)
+        
+        predictions = {}
+        for model_name, model in self.models.items():
+            if model_name == 'lstm':
+                lstm_features = scaled_features.reshape((scaled_features.shape[0], 1, scaled_features.shape[1]))
+                predictions[model_name] = model.predict(lstm_features)
+            else:
+                predictions[model_name] = model.predict(scaled_features)
+                
+        # Combine predictions with model weights
+        combined_predictions = np.zeros(predictions['linear'].shape)
+        for model_name, model_predictions in predictions.items():
+            weight = ML_CONFIG['models'][model_name]['weight']
+            combined_predictions += weight * model_predictions
+            
+        return combined_predictions
+        
+    def evaluate(self, data: pd.DataFrame) -> Dict[str, float]:
+        """Evaluate model performance on test data"""
+        from sklearn.metrics import mean_squared_error, mean_absolute_error
+        
+        features = self.prepare_features(data)
+        targets = self._create_targets(data)
+        scaled_features = self.scalers['features'].transform(features)
+        
+        predictions = self.predict(data)
+        
+        mse = mean_squared_error(targets, predictions)
+        mae = mean_absolute_error(targets, predictions)
+        accuracy = np.mean(np.sign(predictions) == np.sign(targets))
+        
+        self.prediction_metrics['mse'].append(mse)
+        self.prediction_metrics['mae'].append(mae)
+        self.prediction_metrics['accuracy'].append(accuracy)
+        
+        return {
+            'mse': mse,
+            'mae': mae,
+            'accuracy': accuracy
+        }
+        
+    def retrain_if_needed(self, data: pd.DataFrame):
+        """Retrain models if retrain interval has passed"""
+        if not self.last_train_time or (datetime.now() - self.last_train_time).total_seconds() / 3600 >= ML_CONFIG['retrain_interval']:
+            self.train_models(data)
