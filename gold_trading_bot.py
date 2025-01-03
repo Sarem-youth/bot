@@ -2,11 +2,23 @@ import json
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import Tuple
+from datetime import datetime, timedelta
+from typing import Tuple, Dict, List
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+from flask import Flask, render_template, jsonify, request
+import threading
+import queue
+from io import BytesIO
+import base64
+import logging
+import os
+
+# Initialize Flask
+app = Flask(__name__, template_folder='./')
+signal_queue = queue.Queue()
+analysis_results = {}
 
 def load_config():
     with open('config.json') as f:
@@ -417,6 +429,172 @@ def plot_equity_curve(df: pd.DataFrame, metrics: dict):
     plt.tight_layout()
     plt.show()
 
+class Strategy:
+    def __init__(self, name: str):
+        self.name = name
+        self.signals = []
+        self.performance = {}
+        self.current_position = 0
+        self.trades_history = []
+
+    def calculate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
+    def backtest(self, df: pd.DataFrame, initial_balance: float = 10000.0, lot_size: float = 0.01) -> Dict:
+        return {}
+
+class MAStrategy(Strategy):
+    def __init__(self):
+        super().__init__("Moving Average Crossover")
+
+    def calculate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df['MA50'] = df['close'].rolling(window=50).mean()
+        df['MA200'] = df['close'].rolling(window=200).mean()
+        df['signal'] = np.where(
+            (df['MA50'] > df['MA200']) & (df['MA50'].shift(1) <= df['MA200'].shift(1)),
+            1,
+            np.where(
+                (df['MA50'] < df['MA200']) & (df['MA50'].shift(1) >= df['MA200'].shift(1)),
+                -1,
+                0
+            )
+        )
+        return df
+
+class RSIStrategy(Strategy):
+    def __init__(self):
+        super().__init__("RSI")
+
+    def calculate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # ... RSI calculation code ...
+        return df
+
+class SRStrategy(Strategy):
+    def __init__(self):
+        super().__init__("Support/Resistance")
+
+    def calculate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # ... Support/Resistance calculation code ...
+        return df
+
+class TradingBot:
+    def __init__(self):
+        self.strategies = {
+            'ma': MAStrategy(),
+            'rsi': RSIStrategy(),
+            'sr': SRStrategy()
+        }
+        self.config = load_config()
+        self.current_data = None
+        self.is_running = False
+
+    def fetch_data(self, timeframe=mt5.TIMEFRAME_H1, start_date=None, end_date=None):
+        """
+        Fetch historical data with proper error handling
+        """
+        try:
+            # Convert timeframe string to MT5 timeframe
+            timeframe_map = {
+                'H1': mt5.TIMEFRAME_H1,
+                'H4': mt5.TIMEFRAME_H4,
+                'D1': mt5.TIMEFRAME_D1
+            }
+            mt5_timeframe = timeframe_map.get(timeframe, mt5.TIMEFRAME_H1)
+            
+            # Initialize MT5 if not already initialized
+            if not mt5.initialize():
+                raise Exception(f"Failed to initialize MT5: {mt5.last_error()}")
+            
+            # Default to last 1000 bars if no dates specified
+            if start_date is None and end_date is None:
+                self.current_data = get_gold_historical_data(timeframe=mt5_timeframe, num_bars=1000)
+            else:
+                # Convert dates to timestamps
+                start_ts = pd.Timestamp(start_date).timestamp() if start_date else None
+                end_ts = pd.Timestamp(end_date).timestamp() if end_date else None
+                
+                # Fetch data for date range
+                rates = mt5.copy_rates_range("XAUUSD", mt5_timeframe, 
+                                           pd.Timestamp(start_date).to_pydatetime() if start_date else None,
+                                           pd.Timestamp(end_date).to_pydatetime() if end_date else None)
+                
+                if rates is not None:
+                    df = pd.DataFrame(rates)
+                    df['time'] = pd.to_datetime(df['time'], unit='s')
+                    df.set_index('time', inplace=True)
+                    self.current_data = df
+                else:
+                    raise Exception(f"Failed to get XAUUSD data: {mt5.last_error()}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error fetching data: {str(e)}")
+            self.current_data = None
+            return False
+
+    def analyze_all_strategies(self):
+        if self.current_data is None:
+            return {
+                'error': 'No data available. Please fetch data first.'
+            }
+            
+        results = {}
+        try:
+            for name, strategy in self.strategies.items():
+                df = strategy.calculate_signals(self.current_data)
+                backtest_results = strategy.backtest(df)
+                results[name] = {
+                    'signals': df.tail(10).to_dict('records'),
+                    'performance': backtest_results
+                }
+        except Exception as e:
+            results['error'] = f"Analysis failed: {str(e)}"
+        
+        return results
+
+    def export_to_excel(self, filename: str):
+        with pd.ExcelWriter(filename) as writer:
+            # Write summary sheet
+            summary = pd.DataFrame([s.performance for s in self.strategies.values()])
+            summary.to_excel(writer, sheet_name='Summary')
+
+            # Write detailed analysis for each strategy
+            for name, strategy in self.strategies.items():
+                df = strategy.calculate_signals(self.current_data)
+                df.to_excel(writer, sheet_name=f'{name}_Analysis')
+
+# Flask routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    try:
+        data = request.json
+        timeframe = data.get('timeframe', 'H1')
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
+        
+        bot = TradingBot()
+        if not bot.fetch_data(timeframe, start_date, end_date):
+            return jsonify({'error': 'Failed to fetch data'}), 400
+            
+        results = bot.analyze_all_strategies()
+        return jsonify(results)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/export', methods=['POST'])
+def export_analysis():
+    # ... Excel export endpoint ...
+    pass
+
 def main():
     if not initialize_mt5():
         return
@@ -456,7 +634,8 @@ def main():
         print_signals(gold_data)
         check_and_execute_signals(gold_data, config)
     
-    mt5.shutdown()
+    # Start Flask server
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False)).start()
 
 if __name__ == "__main__":
     main()
