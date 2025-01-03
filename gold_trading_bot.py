@@ -441,7 +441,44 @@ class Strategy:
         return df
 
     def backtest(self, df: pd.DataFrame, initial_balance: float = 10000.0, lot_size: float = 0.01) -> Dict:
-        return {}
+        df = df.copy()
+        position = 0
+        entry_price = 0
+        balance = initial_balance
+        trades = []
+        
+        point_value = mt5.symbol_info("XAUUSD").point * 100
+        
+        for i in range(1, len(df)):
+            signal = df.iloc[i].get('signal', 0)
+            
+            # Close existing position
+            if position != 0 and ((position == 1 and signal == -1) or (position == -1 and signal == 1)):
+                pnl = (df.iloc[i]['close'] - entry_price) * position * lot_size * point_value
+                balance += pnl
+                position = 0
+        
+        # Open new position
+        if position == 0:
+            if buy_signals >= 2:
+                position = 1
+                entry_price = df.iloc[i]['close']
+            elif sell_signals >= 2:
+                position = -1
+                entry_price = df.iloc[i]['close']
+        
+        # Update positions and equity
+        df.iloc[i, df.columns.get_loc('position')] = position
+        if position != 0:
+            unrealized_pnl = (df.iloc[i]['close'] - entry_price) * position * lot_size * point_value
+            df.iloc[i, df.columns.get_loc('equity')] = balance + unrealized_pnl
+        else:
+            df.iloc[i, df.columns.get_loc('equity')] = balance
+        
+        # Calculate returns
+        df.iloc[i, df.columns.get_loc('returns')] = df.iloc[i]['equity'] - df.iloc[i-1]['equity']
+    
+    return df
 
 class MAStrategy(Strategy):
     def __init__(self):
